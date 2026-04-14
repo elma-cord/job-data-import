@@ -19,6 +19,7 @@ DAYS_BACK = int(os.getenv("DAYS_BACK", "7"))
 PER_PAGE = int(os.getenv("PER_PAGE", "100"))
 MAX_GLOBAL_PAGES = int(os.getenv("MAX_GLOBAL_PAGES", "1"))
 MAX_COMPANY_PAGES = int(os.getenv("MAX_COMPANY_PAGES", "1"))
+MAX_OUTPUT_ROWS = int(os.getenv("MAX_OUTPUT_ROWS", "100"))
 
 FETCH_COMPANY_JOBS = os.getenv("FETCH_COMPANY_JOBS", "true").lower() == "true"
 FETCH_GLOBAL_JOBS = os.getenv("FETCH_GLOBAL_JOBS", "true").lower() == "true"
@@ -37,32 +38,25 @@ RAW_GLOBAL_JSON_PATH = OUTPUT_DIR / "raw_global_jobs.json"
 FIELDNAMES = [
     "source",
     "source_company_domain",
-
     "id",
     "type",
-
     "title",
     "translated_title",
     "normalized_title",
     "description",
     "url",
-
     "first_seen_at",
     "last_seen_at",
     "last_processed_at",
     "posted_at",
-
     "contract_types",
     "categories",
-
     "onet_code",
     "onet_family",
     "onet_occupation_name",
-
     "recruiter_name",
     "recruiter_title",
     "recruiter_contact",
-
     "salary",
     "salary_low",
     "salary_high",
@@ -70,20 +64,16 @@ FIELDNAMES = [
     "salary_low_usd",
     "salary_high_usd",
     "salary_time_unit",
-
     "seniority",
     "status",
     "language",
-
     "location",
     "location_data",
     "tags",
-
     "company_id",
     "company_name",
     "company_domain",
     "company_ticker",
-
     "raw_json",
 ]
 
@@ -99,7 +89,6 @@ def safe_json(value: Any) -> str:
 def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
-
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
@@ -219,32 +208,25 @@ def flatten_job(
     row = {
         "source": source,
         "source_company_domain": source_company_domain,
-
         "id": job.get("id"),
         "type": job.get("type"),
-
         "title": attrs.get("title"),
         "translated_title": attrs.get("translated_title"),
         "normalized_title": attrs.get("normalized_title"),
         "description": attrs.get("description"),
         "url": attrs.get("url"),
-
         "first_seen_at": attrs.get("first_seen_at"),
         "last_seen_at": attrs.get("last_seen_at"),
         "last_processed_at": attrs.get("last_processed_at"),
         "posted_at": attrs.get("posted_at"),
-
         "contract_types": safe_json(attrs.get("contract_types")),
         "categories": safe_json(attrs.get("categories")),
-
         "onet_code": onet_data.get("code"),
         "onet_family": onet_data.get("family"),
         "onet_occupation_name": onet_data.get("occupation_name"),
-
         "recruiter_name": recruiter_data.get("name"),
         "recruiter_title": recruiter_data.get("title"),
         "recruiter_contact": recruiter_data.get("contact"),
-
         "salary": attrs.get("salary"),
         "salary_low": salary_data.get("salary_low"),
         "salary_high": salary_data.get("salary_high"),
@@ -252,20 +234,16 @@ def flatten_job(
         "salary_low_usd": salary_data.get("salary_low_usd"),
         "salary_high_usd": salary_data.get("salary_high_usd"),
         "salary_time_unit": salary_data.get("salary_time_unit"),
-
         "seniority": attrs.get("seniority"),
         "status": attrs.get("status"),
         "language": attrs.get("language"),
-
         "location": attrs.get("location"),
         "location_data": safe_json(attrs.get("location_data")),
         "tags": safe_json(attrs.get("tags")),
-
         "company_id": company.get("company_id") or company_id,
         "company_name": company.get("company_name"),
         "company_domain": company.get("company_domain"),
         "company_ticker": company.get("company_ticker"),
-
         "raw_json": safe_json(job),
     }
 
@@ -297,8 +275,8 @@ def fetch_company_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dic
             })
 
             companies = company_lookup(payload.get("included", []) or [])
-
             page_jobs = payload.get("data", []) or []
+
             if not page_jobs:
                 break
 
@@ -312,7 +290,7 @@ def fetch_company_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dic
                     flatten_job(
                         job=job,
                         companies=companies,
-                        source="company",
+                        source="tracked company",
                         source_company_domain=domain,
                     )
                 )
@@ -343,8 +321,8 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
         })
 
         companies = company_lookup(payload.get("included", []) or [])
-
         page_jobs = payload.get("data", []) or []
+
         if not page_jobs:
             break
 
@@ -358,7 +336,7 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
                 flatten_job(
                     job=job,
                     companies=companies,
-                    source="global",
+                    source="global company",
                 )
             )
 
@@ -412,6 +390,7 @@ def main() -> None:
 
     print(f"[INFO] DAYS_BACK: {DAYS_BACK}")
     print(f"[INFO] Cutoff last_seen_at: {cutoff.isoformat()}")
+    print(f"[INFO] MAX_OUTPUT_ROWS: {MAX_OUTPUT_ROWS}")
     print(f"[INFO] FETCH_COMPANY_JOBS: {FETCH_COMPANY_JOBS}")
     print(f"[INFO] FETCH_GLOBAL_JOBS: {FETCH_GLOBAL_JOBS}")
 
@@ -426,7 +405,11 @@ def main() -> None:
     if FETCH_GLOBAL_JOBS:
         global_rows, raw_global_payloads = fetch_global_jobs(cutoff)
 
+    company_rows = company_rows[:MAX_OUTPUT_ROWS]
+    global_rows = global_rows[:MAX_OUTPUT_ROWS]
+
     combined_rows = dedupe_rows(company_rows + global_rows)
+    combined_rows = combined_rows[:MAX_OUTPUT_ROWS]
 
     write_csv(COMPANY_CSV_PATH, company_rows)
     write_csv(GLOBAL_CSV_PATH, global_rows)

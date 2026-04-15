@@ -26,13 +26,17 @@ jobs:
 
           DAYS_BACK: "7"
           PER_PAGE: "100"
-          MAX_OUTPUT_ROWS: "100"
 
           FETCH_COMPANY_JOBS: "true"
           FETCH_GLOBAL_JOBS: "true"
 
+          MAX_COMPANIES: "10"
           MAX_COMPANY_PAGES: "1"
           MAX_GLOBAL_PAGES: "1"
+
+          MAX_COMPANY_JOBS: "10"
+          MAX_GLOBAL_JOBS: "10"
+          MAX_OUTPUT_ROWS: "20"
 
       - name: Upload output files
         uses: actions/upload-artifact@v4

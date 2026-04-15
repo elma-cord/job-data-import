@@ -13,6 +13,7 @@ import requests
 BASE_URL = "https://predictleads.com/api/v3"
 
 API_KEY = os.getenv("PREDICTLEADS_API_KEY", "").strip()
+API_TOKEN = os.getenv("PREDICTLEADS_API_TOKEN", "").strip()
 
 DAYS_BACK = int(os.getenv("DAYS_BACK", "7"))
 PER_PAGE = int(os.getenv("PER_PAGE", "100"))
@@ -81,6 +82,7 @@ def is_recent_english_job(attrs: Dict[str, Any], cutoff: datetime) -> bool:
 def build_params(page: int) -> Dict[str, Any]:
     return {
         "api_key": API_KEY,
+        "api_token": API_TOKEN,
         "page": page,
         "per_page": PER_PAGE,
     }
@@ -371,9 +373,9 @@ def write_json(path: Path, data: Any) -> None:
 
 
 def main() -> None:
-    if not API_KEY:
+    if not API_KEY or not API_TOKEN:
         raise RuntimeError(
-            "Missing PredictLeads credential. Add PREDICTLEADS_API_KEY as a GitHub Secret."
+            "Missing PredictLeads credentials. Add both PREDICTLEADS_API_KEY and PREDICTLEADS_API_TOKEN as GitHub Secrets."
         )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

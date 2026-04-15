@@ -16,9 +16,14 @@ API_KEY = os.getenv("PREDICTLEADS_API_KEY", "").strip()
 
 DAYS_BACK = int(os.getenv("DAYS_BACK", "7"))
 PER_PAGE = int(os.getenv("PER_PAGE", "100"))
-MAX_GLOBAL_PAGES = int(os.getenv("MAX_GLOBAL_PAGES", "1"))
+
+MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "10"))
 MAX_COMPANY_PAGES = int(os.getenv("MAX_COMPANY_PAGES", "1"))
-MAX_OUTPUT_ROWS = int(os.getenv("MAX_OUTPUT_ROWS", "100"))
+MAX_GLOBAL_PAGES = int(os.getenv("MAX_GLOBAL_PAGES", "1"))
+
+MAX_COMPANY_JOBS = int(os.getenv("MAX_COMPANY_JOBS", "10"))
+MAX_GLOBAL_JOBS = int(os.getenv("MAX_GLOBAL_JOBS", "10"))
+MAX_OUTPUT_ROWS = int(os.getenv("MAX_OUTPUT_ROWS", "20"))
 
 FETCH_COMPANY_JOBS = os.getenv("FETCH_COMPANY_JOBS", "true").lower() == "true"
 FETCH_GLOBAL_JOBS = os.getenv("FETCH_GLOBAL_JOBS", "true").lower() == "true"
@@ -125,7 +130,11 @@ def read_company_domains() -> List[str]:
                 domains.append(domain)
 
     unique_domains = sorted(set(domains))
-    print(f"[INFO] Loaded company domains: {len(unique_domains)}")
+
+    if MAX_COMPANIES > 0:
+        unique_domains = unique_domains[:MAX_COMPANIES]
+
+    print(f"[INFO] Loaded company domains for this run: {len(unique_domains)}")
     return unique_domains
 
 
@@ -222,9 +231,16 @@ def fetch_company_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dic
     raw_payloads = []
 
     for index, domain in enumerate(domains, start=1):
+        if len(rows) >= MAX_COMPANY_JOBS:
+            print(f"[INFO] Reached MAX_COMPANY_JOBS={MAX_COMPANY_JOBS}")
+            break
+
         print(f"\n[INFO] Company {index}/{len(domains)}: {domain}")
 
         for page in range(1, MAX_COMPANY_PAGES + 1):
+            if len(rows) >= MAX_COMPANY_JOBS:
+                break
+
             encoded_domain = quote(domain, safe="")
             url = f"{BASE_URL}/companies/{encoded_domain}/job_openings"
 
@@ -247,6 +263,9 @@ def fetch_company_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dic
                 break
 
             for job in page_jobs:
+                if len(rows) >= MAX_COMPANY_JOBS:
+                    break
+
                 attrs = job.get("attributes", {}) or {}
 
                 if not is_recent_english_job(attrs, cutoff):
@@ -271,6 +290,10 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
     raw_payloads = []
 
     for page in range(1, MAX_GLOBAL_PAGES + 1):
+        if len(rows) >= MAX_GLOBAL_JOBS:
+            print(f"[INFO] Reached MAX_GLOBAL_JOBS={MAX_GLOBAL_JOBS}")
+            break
+
         print(f"\n[INFO] Global jobs page {page}/{MAX_GLOBAL_PAGES}")
 
         url = f"{BASE_URL}/discover/job_openings"
@@ -293,6 +316,9 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
             break
 
         for job in page_jobs:
+            if len(rows) >= MAX_GLOBAL_JOBS:
+                break
+
             attrs = job.get("attributes", {}) or {}
 
             if not is_recent_english_job(attrs, cutoff):
@@ -356,6 +382,9 @@ def main() -> None:
 
     print(f"[INFO] DAYS_BACK: {DAYS_BACK}")
     print(f"[INFO] Cutoff last_seen_at: {cutoff.isoformat()}")
+    print(f"[INFO] MAX_COMPANIES: {MAX_COMPANIES}")
+    print(f"[INFO] MAX_COMPANY_JOBS: {MAX_COMPANY_JOBS}")
+    print(f"[INFO] MAX_GLOBAL_JOBS: {MAX_GLOBAL_JOBS}")
     print(f"[INFO] MAX_OUTPUT_ROWS: {MAX_OUTPUT_ROWS}")
     print(f"[INFO] FETCH_COMPANY_JOBS: {FETCH_COMPANY_JOBS}")
     print(f"[INFO] FETCH_GLOBAL_JOBS: {FETCH_GLOBAL_JOBS}")
@@ -371,8 +400,8 @@ def main() -> None:
     if FETCH_GLOBAL_JOBS:
         global_rows, raw_global_payloads = fetch_global_jobs(cutoff)
 
-    company_rows = company_rows[:MAX_OUTPUT_ROWS]
-    global_rows = global_rows[:MAX_OUTPUT_ROWS]
+    company_rows = company_rows[:MAX_COMPANY_JOBS]
+    global_rows = global_rows[:MAX_GLOBAL_JOBS]
 
     combined_rows = dedupe_rows(company_rows + global_rows)
     combined_rows = combined_rows[:MAX_OUTPUT_ROWS]

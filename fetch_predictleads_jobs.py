@@ -22,6 +22,7 @@ GLOBAL_PER_PAGE = int(os.getenv("GLOBAL_PER_PAGE", "10"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 
 GLOBAL_LOCATION = os.getenv("GLOBAL_LOCATION", "United Kingdom").strip()
+GLOBAL_ONET_CODES = os.getenv("GLOBAL_ONET_CODES", "15-1252.00").strip()
 COMPANY_LOCATION_FILTER = os.getenv("COMPANY_LOCATION_FILTER", "United Kingdom").strip()
 
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "10"))
@@ -47,9 +48,9 @@ RAW_GLOBAL_JSON_PATH = OUTPUT_DIR / "raw_global_jobs.json"
 
 
 FIELDNAMES = [
-    "source", "source_company_domain", "global_location", "company_location_filter",
-    "id", "type", "title", "translated_title", "normalized_title",
-    "description", "url", "first_seen_at", "last_seen_at",
+    "source", "source_company_domain", "global_location", "global_onet_codes",
+    "company_location_filter", "id", "type", "title", "translated_title",
+    "normalized_title", "description", "url", "first_seen_at", "last_seen_at",
     "last_processed_at", "posted_at", "contract_types", "categories",
     "onet_code", "onet_family", "onet_occupation_name",
     "recruiter_name", "recruiter_title", "recruiter_contact",
@@ -93,6 +94,7 @@ def location_matches(attrs: Dict[str, Any], required_location: str) -> bool:
         for item in location_data:
             if not isinstance(item, dict):
                 continue
+
             values = [
                 item.get("city"),
                 item.get("state"),
@@ -101,6 +103,7 @@ def location_matches(attrs: Dict[str, Any], required_location: str) -> bool:
                 item.get("continent"),
             ]
             joined = " ".join(str(v).lower() for v in values if v)
+
             if required in joined:
                 return True
 
@@ -115,7 +118,12 @@ def is_recent_english_job(attrs: Dict[str, Any], cutoff: datetime) -> bool:
     return bool(last_seen_at and last_seen_at >= cutoff)
 
 
-def build_params(page: int, per_page: int, location: str = "") -> Dict[str, Any]:
+def build_params(
+    page: int,
+    per_page: int,
+    location: str = "",
+    onet_codes: str = "",
+) -> Dict[str, Any]:
     params = {
         "api_key": API_KEY,
         "api_token": API_TOKEN,
@@ -125,6 +133,9 @@ def build_params(page: int, per_page: int, location: str = "") -> Dict[str, Any]
 
     if location:
         params["location"] = location
+
+    if onet_codes:
+        params["onet_codes"] = onet_codes
 
     return params
 
@@ -208,6 +219,7 @@ def flatten_job(
     source: str,
     source_company_domain: str = "",
     global_location: str = "",
+    global_onet_codes: str = "",
     company_location_filter: str = "",
 ) -> Dict[str, Any]:
     attrs = job.get("attributes", {}) or {}
@@ -229,6 +241,7 @@ def flatten_job(
         "source": source,
         "source_company_domain": source_company_domain,
         "global_location": global_location,
+        "global_onet_codes": global_onet_codes,
         "company_location_filter": company_location_filter,
         "id": job.get("id"),
         "type": job.get("type"),
@@ -294,7 +307,11 @@ def fetch_company_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dic
             try:
                 payload = request_json(
                     url,
-                    build_params(page, COMPANY_PER_PAGE, location=COMPANY_LOCATION_FILTER),
+                    build_params(
+                        page=page,
+                        per_page=COMPANY_PER_PAGE,
+                        location=COMPANY_LOCATION_FILTER,
+                    ),
                 )
             except Exception as exc:
                 print(f"[ERROR] Failed for company {domain}, page {page}: {exc}")
@@ -351,13 +368,19 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
 
         print(f"\n[INFO] Global jobs page {page}/{MAX_GLOBAL_PAGES}")
         print(f"[INFO] Global location: {GLOBAL_LOCATION}")
+        print(f"[INFO] Global O*NET codes: {GLOBAL_ONET_CODES}")
 
         url = f"{BASE_URL}/discover/job_openings"
 
         try:
             payload = request_json(
                 url,
-                build_params(page, GLOBAL_PER_PAGE, location=GLOBAL_LOCATION),
+                build_params(
+                    page=page,
+                    per_page=GLOBAL_PER_PAGE,
+                    location=GLOBAL_LOCATION,
+                    onet_codes=GLOBAL_ONET_CODES,
+                ),
             )
         except Exception as exc:
             print(f"[ERROR] Failed global page {page}: {exc}")
@@ -366,6 +389,7 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
         raw_payloads.append({
             "page": page,
             "location": GLOBAL_LOCATION,
+            "onet_codes": GLOBAL_ONET_CODES,
             "payload": payload,
         })
 
@@ -393,6 +417,7 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
                     companies=companies,
                     source="global company",
                     global_location=GLOBAL_LOCATION,
+                    global_onet_codes=GLOBAL_ONET_CODES,
                 )
             )
 
@@ -447,6 +472,7 @@ def main() -> None:
     print(f"[INFO] DAYS_BACK: {DAYS_BACK}")
     print(f"[INFO] Cutoff last_seen_at: {cutoff.isoformat()}")
     print(f"[INFO] GLOBAL_LOCATION: {GLOBAL_LOCATION}")
+    print(f"[INFO] GLOBAL_ONET_CODES: {GLOBAL_ONET_CODES}")
     print(f"[INFO] COMPANY_LOCATION_FILTER: {COMPANY_LOCATION_FILTER}")
     print(f"[INFO] COMPANY_PER_PAGE: {COMPANY_PER_PAGE}")
     print(f"[INFO] GLOBAL_PER_PAGE: {GLOBAL_PER_PAGE}")

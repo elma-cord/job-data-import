@@ -31,7 +31,7 @@ jobs:
           GLOBAL_PER_PAGE: "10"
           REQUEST_TIMEOUT_SECONDS: "120"
 
-          GLOBAL_LOCATION: "United Kingdom"
+          GLOBAL_LOCATION: "London, United Kingdom"
           COMPANY_LOCATION_FILTER: "United Kingdom"
 
           FETCH_COMPANY_JOBS: "true"

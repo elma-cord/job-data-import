@@ -16,9 +16,13 @@ API_KEY = os.getenv("PREDICTLEADS_API_KEY", "").strip()
 API_TOKEN = os.getenv("PREDICTLEADS_API_TOKEN", "").strip()
 
 DAYS_BACK = int(os.getenv("DAYS_BACK", "7"))
-PER_PAGE = int(os.getenv("PER_PAGE", "100"))
+
+COMPANY_PER_PAGE = int(os.getenv("COMPANY_PER_PAGE", "10"))
+GLOBAL_PER_PAGE = int(os.getenv("GLOBAL_PER_PAGE", "10"))
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 
 GLOBAL_LOCATION = os.getenv("GLOBAL_LOCATION", "United Kingdom").strip()
+COMPANY_LOCATION_FILTER = os.getenv("COMPANY_LOCATION_FILTER", "United Kingdom").strip()
 
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "10"))
 MAX_COMPANY_PAGES = int(os.getenv("MAX_COMPANY_PAGES", "1"))
@@ -43,7 +47,7 @@ RAW_GLOBAL_JSON_PATH = OUTPUT_DIR / "raw_global_jobs.json"
 
 
 FIELDNAMES = [
-    "source", "source_company_domain", "global_location",
+    "source", "source_company_domain", "global_location", "company_location_filter",
     "id", "type", "title", "translated_title", "normalized_title",
     "description", "url", "first_seen_at", "last_seen_at",
     "last_processed_at", "posted_at", "contract_types", "categories",
@@ -74,6 +78,35 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def location_matches(attrs: Dict[str, Any], required_location: str) -> bool:
+    if not required_location:
+        return True
+
+    required = required_location.lower()
+
+    location_text = str(attrs.get("location") or "").lower()
+    if required in location_text:
+        return True
+
+    location_data = attrs.get("location_data") or []
+    if isinstance(location_data, list):
+        for item in location_data:
+            if not isinstance(item, dict):
+                continue
+            values = [
+                item.get("city"),
+                item.get("state"),
+                item.get("country"),
+                item.get("region"),
+                item.get("continent"),
+            ]
+            joined = " ".join(str(v).lower() for v in values if v)
+            if required in joined:
+                return True
+
+    return False
+
+
 def is_recent_english_job(attrs: Dict[str, Any], cutoff: datetime) -> bool:
     if attrs.get("language") != "en":
         return False
@@ -82,16 +115,16 @@ def is_recent_english_job(attrs: Dict[str, Any], cutoff: datetime) -> bool:
     return bool(last_seen_at and last_seen_at >= cutoff)
 
 
-def build_params(page: int, include_global_location: bool = False) -> Dict[str, Any]:
+def build_params(page: int, per_page: int, location: str = "") -> Dict[str, Any]:
     params = {
         "api_key": API_KEY,
         "api_token": API_TOKEN,
         "page": page,
-        "per_page": PER_PAGE,
+        "per_page": per_page,
     }
 
-    if include_global_location:
-        params["location"] = GLOBAL_LOCATION
+    if location:
+        params["location"] = location
 
     return params
 
@@ -103,7 +136,7 @@ def request_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         url,
         params=clean_params,
         headers={"Accept": "application/json"},
-        timeout=60,
+        timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
     print(f"[INFO] GET {response.url}")
@@ -175,6 +208,7 @@ def flatten_job(
     source: str,
     source_company_domain: str = "",
     global_location: str = "",
+    company_location_filter: str = "",
 ) -> Dict[str, Any]:
     attrs = job.get("attributes", {}) or {}
 
@@ -195,6 +229,7 @@ def flatten_job(
         "source": source,
         "source_company_domain": source_company_domain,
         "global_location": global_location,
+        "company_location_filter": company_location_filter,
         "id": job.get("id"),
         "type": job.get("type"),
         "title": attrs.get("title"),
@@ -257,7 +292,10 @@ def fetch_company_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dic
             url = f"{BASE_URL}/companies/{encoded_domain}/job_openings"
 
             try:
-                payload = request_json(url, build_params(page))
+                payload = request_json(
+                    url,
+                    build_params(page, COMPANY_PER_PAGE, location=COMPANY_LOCATION_FILTER),
+                )
             except Exception as exc:
                 print(f"[ERROR] Failed for company {domain}, page {page}: {exc}")
                 continue
@@ -265,6 +303,7 @@ def fetch_company_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dic
             raw_payloads.append({
                 "company_domain": domain,
                 "page": page,
+                "location": COMPANY_LOCATION_FILTER,
                 "payload": payload,
             })
 
@@ -283,12 +322,16 @@ def fetch_company_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dic
                 if not is_recent_english_job(attrs, cutoff):
                     continue
 
+                if not location_matches(attrs, COMPANY_LOCATION_FILTER):
+                    continue
+
                 rows.append(
                     flatten_job(
                         job=job,
                         companies=companies,
                         source="tracked company",
                         source_company_domain=domain,
+                        company_location_filter=COMPANY_LOCATION_FILTER,
                     )
                 )
 
@@ -312,7 +355,10 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
         url = f"{BASE_URL}/discover/job_openings"
 
         try:
-            payload = request_json(url, build_params(page, include_global_location=True))
+            payload = request_json(
+                url,
+                build_params(page, GLOBAL_PER_PAGE, location=GLOBAL_LOCATION),
+            )
         except Exception as exc:
             print(f"[ERROR] Failed global page {page}: {exc}")
             continue
@@ -336,6 +382,9 @@ def fetch_global_jobs(cutoff: datetime) -> tuple[List[Dict[str, Any]], List[Dict
             attrs = job.get("attributes", {}) or {}
 
             if not is_recent_english_job(attrs, cutoff):
+                continue
+
+            if not location_matches(attrs, GLOBAL_LOCATION):
                 continue
 
             rows.append(
@@ -398,6 +447,10 @@ def main() -> None:
     print(f"[INFO] DAYS_BACK: {DAYS_BACK}")
     print(f"[INFO] Cutoff last_seen_at: {cutoff.isoformat()}")
     print(f"[INFO] GLOBAL_LOCATION: {GLOBAL_LOCATION}")
+    print(f"[INFO] COMPANY_LOCATION_FILTER: {COMPANY_LOCATION_FILTER}")
+    print(f"[INFO] COMPANY_PER_PAGE: {COMPANY_PER_PAGE}")
+    print(f"[INFO] GLOBAL_PER_PAGE: {GLOBAL_PER_PAGE}")
+    print(f"[INFO] REQUEST_TIMEOUT_SECONDS: {REQUEST_TIMEOUT_SECONDS}")
     print(f"[INFO] MAX_COMPANIES: {MAX_COMPANIES}")
     print(f"[INFO] MAX_COMPANY_JOBS: {MAX_COMPANY_JOBS}")
     print(f"[INFO] MAX_GLOBAL_JOBS: {MAX_GLOBAL_JOBS}")

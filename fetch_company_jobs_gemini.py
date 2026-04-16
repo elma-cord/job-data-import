@@ -8,17 +8,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 
-import requests
 from bs4 import BeautifulSoup
 from google import genai
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "5"))
 MAX_JOBS_OUTPUT = int(os.getenv("MAX_JOBS_OUTPUT", "500"))
-REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+MAX_JOB_LINKS_PER_COMPANY = int(os.getenv("MAX_JOB_LINKS_PER_COMPANY", "50"))
+
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "45"))
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
 
 COMPANIES_CSV = Path("companies.csv")
@@ -43,6 +49,9 @@ FIELDNAMES = [
     "job_title",
     "job_url",
     "job_location",
+    "job_description",
+    "job_posted_date",
+    "job_posted_date_source",
     "confidence",
     "reason",
     "checked_at_utc",
@@ -63,15 +72,48 @@ CAREER_LINK_KEYWORDS = [
     "recruitment",
 ]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+JOB_LINK_KEYWORDS = [
+    "job",
+    "jobs",
+    "vacancy",
+    "vacancies",
+    "role",
+    "roles",
+    "position",
+    "positions",
+    "opening",
+    "openings",
+    "apply",
+    "view vacancy",
+    "view role",
+    "view job",
+    "read more",
+    "learn more",
+]
 
+NON_JOB_LINK_KEYWORDS = [
+    "privacy",
+    "cookie",
+    "terms",
+    "contact",
+    "about",
+    "blog",
+    "news",
+    "login",
+    "signin",
+    "sign-in",
+    "register",
+    "facebook",
+    "linkedin",
+    "instagram",
+    "twitter",
+    "youtube",
+]
+
+
+# =========================================================
+# NORMALIZATION HELPERS
+# =========================================================
 
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
@@ -105,11 +147,6 @@ def domain_from_url(url: str) -> str:
         return ""
 
 
-def clean_page_text(text: str, max_chars: int = 30000) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    return text[:max_chars]
-
-
 def same_or_subdomain(url: str, company_domain: str) -> bool:
     try:
         host = normalize_domain(urlparse(url).netloc)
@@ -118,6 +155,23 @@ def same_or_subdomain(url: str, company_domain: str) -> bool:
     except Exception:
         return False
 
+
+def clean_page_text(text: str, max_chars: int = 60000) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return text[:max_chars]
+
+
+def safe_json(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+# =========================================================
+# REFERENCE FILES
+# =========================================================
 
 def read_company_file(path: Path) -> tuple[Set[str], Set[str]]:
     domains = set()
@@ -248,14 +302,6 @@ def read_company_domains() -> List[str]:
 
 
 def read_direct_career_pages() -> List[Dict[str, str]]:
-    """
-    Reads companies_career_pages.csv if it exists.
-
-    Expected format:
-    career_page
-    https://example.com/careers
-    https://example.com/jobs
-    """
     if not COMPANIES_CAREER_PAGES_CSV.exists():
         print("[INFO] companies_career_pages.csv not found. Will use companies.csv instead.")
         return []
@@ -302,6 +348,10 @@ def read_direct_career_pages() -> List[Dict[str, str]]:
     print(f"[INFO] Loaded direct career pages for this run: {len(unique_pages)}")
     return unique_pages
 
+
+# =========================================================
+# FILTER HELPERS
+# =========================================================
 
 def company_matches(company_domain: str, company_name: str, domains: Set[str], names: Set[str]) -> bool:
     domain = normalize_domain(company_domain)
@@ -355,65 +405,172 @@ def should_remove_job(row: Dict[str, Any], ref: Dict[str, Any]) -> bool:
     return False
 
 
-def fetch_html(url: str) -> Optional[str]:
+# =========================================================
+# PLAYWRIGHT HELPERS
+# =========================================================
+
+def block_unneeded_requests(route):
+    request = route.request
+    resource_type = request.resource_type
+
+    if resource_type in {"image", "font", "media"}:
+        route.abort()
+    else:
+        route.continue_()
+
+
+def safe_goto(page, url: str) -> bool:
     try:
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            allow_redirects=True,
-        )
-
-        print(f"[INFO] GET {url} -> {response.status_code}")
-
-        if response.status_code >= 400:
-            return None
-
-        content_type = response.headers.get("content-type", "")
-        if "text/html" not in content_type and "application/xhtml" not in content_type:
-            return None
-
-        return response.text
-
+        page.goto(url, wait_until="networkidle", timeout=REQUEST_TIMEOUT_SECONDS * 1000)
+        return True
+    except PlaywrightTimeoutError:
+        print(f"[WARN] Timeout opening {url}; trying domcontentloaded")
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT_SECONDS * 1000)
+            return True
+        except Exception as exc:
+            print(f"[WARN] Failed opening {url}: {exc}")
+            return False
     except Exception as exc:
-        print(f"[WARN] Failed to fetch {url}: {exc}")
-        return None
+        print(f"[WARN] Failed opening {url}: {exc}")
+        return False
 
 
-def extract_links(base_url: str, html: str, company_domain: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
+def rendered_page_text(page, max_chars: int = 60000) -> str:
+    try:
+        text = page.locator("body").inner_text(timeout=5000)
+        return clean_page_text(text, max_chars=max_chars)
+    except Exception:
+        return ""
 
-    for a in soup.find_all("a", href=True):
-        href = str(a.get("href") or "").strip()
-        text = normalize_text(a.get_text(" "))
-        full_url = urljoin(base_url, href)
 
-        if not full_url.startswith("http"):
-            continue
+def rendered_html(page) -> str:
+    try:
+        return page.content()
+    except Exception:
+        return ""
 
-        combined = normalize_text(f"{href} {text}")
 
-        if any(keyword in combined for keyword in CAREER_LINK_KEYWORDS):
-            links.append(full_url)
+def extract_rendered_links(page, base_url: str, company_domain: str, job_like_only: bool = False) -> List[Dict[str, str]]:
+    try:
+        links = page.evaluate(
+            """
+            () => Array.from(document.querySelectorAll('a[href]')).map(a => ({
+                text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
+                href: a.href,
+                outer_html: a.outerHTML.slice(0, 500)
+            }))
+            """
+        )
+    except Exception:
+        links = []
 
-    unique = []
+    output = []
     seen = set()
 
-    for link in links:
-        link = normalize_url(link)
-        if link in seen:
+    for item in links:
+        href = normalize_url(item.get("href", ""))
+        text = str(item.get("text") or "").strip()
+        outer_html = str(item.get("outer_html") or "").strip()
+
+        if not href or not href.startswith("http"):
             continue
-        seen.add(link)
-        unique.append(link)
 
-    return unique[:15]
+        if not same_or_subdomain(href, company_domain):
+            continue
+
+        combined = normalize_text(f"{href} {text} {outer_html}")
+
+        if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
+            continue
+
+        if job_like_only and not any(keyword in combined for keyword in JOB_LINK_KEYWORDS):
+            continue
+
+        key = href
+        if key in seen:
+            continue
+        seen.add(key)
+
+        output.append({
+            "text": text,
+            "href": href,
+            "outer_html": outer_html,
+        })
+
+    return output
 
 
-def fallback_career_urls(domain: str) -> List[str]:
-    base = company_website(domain)
+def extract_nearby_job_cards(page) -> List[Dict[str, str]]:
+    """
+    Extracts visible link/card context from rendered page.
+    This helps Gemini match job titles to real URLs.
+    """
+    try:
+        cards = page.evaluate(
+            """
+            () => {
+              const links = Array.from(document.querySelectorAll('a[href]'));
+              return links.map(a => {
+                let container = a;
+                for (let i = 0; i < 5; i++) {
+                  if (container.parentElement) container = container.parentElement;
+                }
+                return {
+                  href: a.href,
+                  link_text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
+                  nearby_text: (container.innerText || '').trim().slice(0, 1200)
+                };
+              });
+            }
+            """
+        )
+    except Exception:
+        cards = []
 
-    paths = [
+    cleaned = []
+    seen = set()
+
+    for card in cards:
+        href = normalize_url(card.get("href", ""))
+        nearby_text = clean_page_text(card.get("nearby_text", ""), max_chars=1200)
+        link_text = str(card.get("link_text") or "").strip()
+
+        if not href or not nearby_text:
+            continue
+
+        key = f"{href}|{nearby_text[:100]}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        cleaned.append({
+            "href": href,
+            "link_text": link_text,
+            "nearby_text": nearby_text,
+        })
+
+    return cleaned[:80]
+
+
+def find_career_pages_from_domain(context, domain: str) -> List[str]:
+    home_url = company_website(domain)
+    page = context.new_page()
+    page.route("**/*", block_unneeded_requests)
+
+    career_urls = []
+
+    if safe_goto(page, home_url):
+        links = extract_rendered_links(page, home_url, domain, job_like_only=False)
+
+        for link in links:
+            combined = normalize_text(f"{link.get('href')} {link.get('text')}")
+            if any(keyword in combined for keyword in CAREER_LINK_KEYWORDS):
+                career_urls.append(link["href"])
+
+    page.close()
+
+    fallback_paths = [
         "/careers",
         "/career",
         "/jobs",
@@ -425,24 +582,13 @@ def fallback_career_urls(domain: str) -> List[str]:
         "/recruitment",
     ]
 
-    return [base + path for path in paths]
-
-
-def find_career_pages(domain: str) -> List[str]:
-    home_url = company_website(domain)
-    html = fetch_html(home_url)
-
-    candidates = []
-
-    if html:
-        candidates.extend(extract_links(home_url, html, domain))
-
-    candidates.extend(fallback_career_urls(domain))
+    for path in fallback_paths:
+        career_urls.append(company_website(domain) + path)
 
     unique = []
     seen = set()
 
-    for url in candidates:
+    for url in career_urls:
         url = normalize_url(url)
         if url in seen:
             continue
@@ -452,88 +598,119 @@ def find_career_pages(domain: str) -> List[str]:
     return unique[:15]
 
 
-def html_to_page_text(html: str, max_chars: int = 30000) -> str:
-    soup = BeautifulSoup(html, "html.parser")
+# =========================================================
+# STRUCTURED DATA / POSTED DATE
+# =========================================================
 
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
+def find_dates_in_object(obj: Any, source_prefix: str = "structured_data") -> List[Dict[str, str]]:
+    results = []
 
-    return clean_page_text(soup.get_text(" "), max_chars=max_chars)
+    date_keys = {
+        "dateposted",
+        "datepublished",
+        "posteddate",
+        "createdat",
+        "published_at",
+        "datecreated",
+        "uploaddate",
+    }
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_norm = normalize_text(key).replace(" ", "").replace("_", "")
+            if key_norm in date_keys and value:
+                results.append({
+                    "date": str(value),
+                    "source": f"{source_prefix}_{key}",
+                })
+            else:
+                results.extend(find_dates_in_object(value, source_prefix))
+    elif isinstance(obj, list):
+        for item in obj:
+            results.extend(find_dates_in_object(item, source_prefix))
+
+    return results
 
 
-def collect_career_page_text_from_direct_url(domain: str, career_page_url: str) -> tuple[List[Dict[str, str]], List[str]]:
-    pages = []
-    successful_urls = []
+def extract_structured_dates_from_html(html: str) -> List[Dict[str, str]]:
+    dates = []
 
-    html = fetch_html(career_page_url)
-    if not html:
-        return pages, successful_urls
+    soup = BeautifulSoup(html or "", "html.parser")
 
-    text = html_to_page_text(html, max_chars=35000)
-
-    if len(text) >= 150:
-        pages.append({
-            "url": career_page_url,
-            "text": text,
-        })
-        successful_urls.append(career_page_url)
-
-    return pages, successful_urls
-
-
-def collect_career_page_text_from_domain(domain: str) -> tuple[List[Dict[str, str]], List[str]]:
-    career_urls = find_career_pages(domain)
-    pages = []
-    successful_urls = []
-
-    for url in career_urls:
-        html = fetch_html(url)
-        if not html:
+    for script in soup.find_all("script", type=lambda x: x and "ld+json" in x.lower()):
+        raw = script.string or script.get_text() or ""
+        raw = raw.strip()
+        if not raw:
             continue
 
-        text = html_to_page_text(html, max_chars=30000)
-
-        if len(text) < 150:
+        try:
+            data = json.loads(raw)
+        except Exception:
             continue
 
-        pages.append({
-            "url": url,
-            "text": text,
-        })
-        successful_urls.append(url)
+        dates.extend(find_dates_in_object(data, "structured_data"))
 
-        if len(pages) >= 5:
-            break
+    meta_names = [
+        "article:published_time",
+        "datePublished",
+        "date",
+        "publish_date",
+        "published_time",
+        "dateposted",
+        "datePosted",
+    ]
 
-        time.sleep(SLEEP_SECONDS)
+    for meta in soup.find_all("meta"):
+        name = meta.get("name") or meta.get("property") or ""
+        content = meta.get("content") or ""
+        if not name or not content:
+            continue
 
-    return pages, successful_urls
+        if normalize_text(name) in {normalize_text(x) for x in meta_names}:
+            dates.append({
+                "date": str(content),
+                "source": f"meta_{name}",
+            })
+
+    return dates
 
 
-def build_prompt(company_domain: str, pages: List[Dict[str, str]]) -> str:
-    pages_text = "\n\n".join(
-        f"CAREER_PAGE_URL: {page['url']}\nPAGE_TEXT:\n{page['text']}"
-        for page in pages
-    )
+def first_structured_date(html: str) -> tuple[str, str]:
+    dates = extract_structured_dates_from_html(html)
+    if not dates:
+        return "", ""
+
+    return dates[0]["date"], dates[0]["source"]
+
+
+# =========================================================
+# GEMINI
+# =========================================================
+
+def build_career_page_prompt(company_domain: str, career_page_url: str, page_text: str, job_cards: List[Dict[str, str]]) -> str:
+    cards_text = json.dumps(job_cards[:80], ensure_ascii=False, indent=2)
 
     return f"""
-You are extracting open jobs from company career pages.
+You are extracting currently open job vacancies from a rendered company career page.
 
 Company domain: {company_domain}
+Career page URL: {career_page_url}
 
 Rules:
 - Return ONLY valid JSON.
 - No markdown.
 - Output must be an object with key "jobs".
 - "jobs" must be a list.
-- Extract ALL currently open jobs from the provided career page text.
+- Extract ALL currently open jobs visible in the provided rendered career page content.
 - Do not filter by category.
 - Do not invent jobs.
 - Do not include closed, expired, unavailable, speculative, or generic talent pool roles unless clearly listed as open.
 - If there are no currently open jobs, return {{"jobs":[]}}.
-- If job URL is missing, use the career page URL where the job was found.
+- Use the most specific job URL from JOB_CARDS when available.
+- Do not use the career page URL as job_url if a more specific vacancy/job URL is available.
+- If the job URL is not visible/available, use an empty string.
 - confidence should be "high", "medium", or "low".
-- reason should be short.
+- reason should be short and explain why the role was extracted.
 
 Return this JSON shape:
 {{
@@ -549,13 +726,67 @@ Return this JSON shape:
   ]
 }}
 
-Career page content:
-{pages_text}
+RENDERED_CAREER_PAGE_TEXT:
+{page_text}
+
+JOB_CARDS_WITH_LINKS:
+{cards_text}
+""".strip()
+
+
+def build_job_page_prompt(
+    company_domain: str,
+    job_url: str,
+    job_page_text: str,
+    structured_posted_date: str,
+    structured_posted_date_source: str,
+) -> str:
+    return f"""
+You are extracting structured data from a job page.
+
+Company domain: {company_domain}
+Job URL: {job_url}
+
+Structured posted date found by parser: {structured_posted_date}
+Structured posted date source: {structured_posted_date_source}
+
+Rules:
+- Return ONLY valid JSON.
+- No markdown.
+- Do not invent information.
+- Extract only what is explicitly present in the job page text or structured posted date fields.
+- job_posted_date:
+  - Use the structured posted date if provided.
+  - Otherwise only extract a visible posted/published date if explicitly shown in the job page text.
+  - If no posted date is available, return empty string.
+- job_posted_date_source:
+  - If using structured posted date, return the provided structured source.
+  - If using visible text, return "visible_text".
+  - If no date exists, return empty string.
+- job_description should be a concise but useful summary of the role based on the page. Do not copy the full page.
+- confidence should be "high", "medium", or "low".
+- reason should be short.
+
+Return this JSON shape:
+{{
+  "company_name": "",
+  "job_title": "",
+  "job_url": "",
+  "job_location": "",
+  "job_description": "",
+  "job_posted_date": "",
+  "job_posted_date_source": "",
+  "confidence": "",
+  "reason": ""
+}}
+
+JOB_PAGE_TEXT:
+{job_page_text}
 """.strip()
 
 
 def parse_gemini_json(text: str) -> Dict[str, Any]:
-    cleaned = text.strip()
+    cleaned = (text or "").strip()
 
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
@@ -570,34 +801,277 @@ def parse_gemini_json(text: str) -> Dict[str, Any]:
         data = json.loads(match.group(0))
 
     if not isinstance(data, dict):
-        return {"jobs": []}
-
-    if "jobs" not in data or not isinstance(data["jobs"], list):
-        return {"jobs": []}
+        return {}
 
     return data
 
 
-def extract_jobs_with_gemini(client: genai.Client, company_domain: str, pages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    if not pages:
-        return []
-
-    prompt = build_prompt(company_domain, pages)
+def extract_jobs_from_career_page_with_gemini(
+    client: genai.Client,
+    company_domain: str,
+    career_page_url: str,
+    page_text: str,
+    job_cards: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    prompt = build_career_page_prompt(company_domain, career_page_url, page_text, job_cards)
 
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
     )
 
-    text = response.text or ""
-    data = parse_gemini_json(text)
-
+    data = parse_gemini_json(response.text or "")
     jobs = data.get("jobs", [])
+
     if not isinstance(jobs, list):
         return []
 
     return [job for job in jobs if isinstance(job, dict)]
 
+
+def enrich_job_page_with_gemini(
+    client: genai.Client,
+    company_domain: str,
+    job_url: str,
+    job_page_text: str,
+    structured_posted_date: str,
+    structured_posted_date_source: str,
+) -> Dict[str, Any]:
+    prompt = build_job_page_prompt(
+        company_domain=company_domain,
+        job_url=job_url,
+        job_page_text=job_page_text,
+        structured_posted_date=structured_posted_date,
+        structured_posted_date_source=structured_posted_date_source,
+    )
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+    )
+
+    data = parse_gemini_json(response.text or "")
+
+    if not isinstance(data, dict):
+        return {}
+
+    return data
+
+
+# =========================================================
+# JOB PAGE PROCESSING
+# =========================================================
+
+def open_job_page_and_extract(context, client: genai.Client, company_domain: str, job_seed: Dict[str, Any]) -> Dict[str, Any]:
+    seed_url = normalize_url(job_seed.get("job_url"))
+
+    if not seed_url:
+        return {
+            "company_name": str(job_seed.get("company_name") or "").strip(),
+            "job_title": str(job_seed.get("job_title") or "").strip(),
+            "job_url": "",
+            "job_location": str(job_seed.get("job_location") or "").strip(),
+            "job_description": "",
+            "job_posted_date": "",
+            "job_posted_date_source": "",
+            "confidence": str(job_seed.get("confidence") or "medium").strip(),
+            "reason": str(job_seed.get("reason") or "Extracted from career page; no specific job URL found.").strip(),
+        }
+
+    page = context.new_page()
+    page.route("**/*", block_unneeded_requests)
+
+    final_url = seed_url
+    page_text = ""
+    html = ""
+
+    try:
+        if safe_goto(page, seed_url):
+            final_url = normalize_url(page.url)
+            page_text = rendered_page_text(page, max_chars=70000)
+            html = rendered_html(page)
+    finally:
+        page.close()
+
+    structured_date, structured_source = first_structured_date(html)
+
+    if not page_text:
+        return {
+            "company_name": str(job_seed.get("company_name") or "").strip(),
+            "job_title": str(job_seed.get("job_title") or "").strip(),
+            "job_url": final_url or seed_url,
+            "job_location": str(job_seed.get("job_location") or "").strip(),
+            "job_description": "",
+            "job_posted_date": structured_date,
+            "job_posted_date_source": structured_source,
+            "confidence": str(job_seed.get("confidence") or "medium").strip(),
+            "reason": "Job page opened but text extraction was limited.",
+        }
+
+    try:
+        enriched = enrich_job_page_with_gemini(
+            client=client,
+            company_domain=company_domain,
+            job_url=final_url or seed_url,
+            job_page_text=page_text,
+            structured_posted_date=structured_date,
+            structured_posted_date_source=structured_source,
+        )
+    except Exception as exc:
+        print(f"[WARN] Gemini job-page enrichment failed for {seed_url}: {exc}")
+        enriched = {}
+
+    return {
+        "company_name": str(enriched.get("company_name") or job_seed.get("company_name") or "").strip(),
+        "job_title": str(enriched.get("job_title") or job_seed.get("job_title") or "").strip(),
+        "job_url": normalize_url(enriched.get("job_url") or final_url or seed_url),
+        "job_location": str(enriched.get("job_location") or job_seed.get("job_location") or "").strip(),
+        "job_description": str(enriched.get("job_description") or "").strip(),
+        "job_posted_date": str(enriched.get("job_posted_date") or structured_date or "").strip(),
+        "job_posted_date_source": str(enriched.get("job_posted_date_source") or structured_source or "").strip(),
+        "confidence": str(enriched.get("confidence") or job_seed.get("confidence") or "medium").strip(),
+        "reason": str(enriched.get("reason") or job_seed.get("reason") or "").strip(),
+    }
+
+
+# =========================================================
+# CAREER PAGE PROCESSING
+# =========================================================
+
+def process_career_page(
+    context,
+    client: genai.Client,
+    company_domain: str,
+    career_page_url: str,
+    ref: Dict[str, Any],
+    checked_at: str,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    rows = []
+
+    raw = {
+        "company_domain": company_domain,
+        "career_page_url": career_page_url,
+        "job_seeds": [],
+        "jobs": [],
+        "error": "",
+    }
+
+    page = context.new_page()
+    page.route("**/*", block_unneeded_requests)
+
+    try:
+        ok = safe_goto(page, career_page_url)
+        if not ok:
+            raw["error"] = "Could not open career page."
+            return rows, raw
+
+        page_text = rendered_page_text(page, max_chars=70000)
+        job_cards = extract_nearby_job_cards(page)
+
+        raw["career_page_text_sample"] = page_text[:5000]
+        raw["job_cards_sample"] = job_cards[:20]
+
+        job_seeds = extract_jobs_from_career_page_with_gemini(
+            client=client,
+            company_domain=company_domain,
+            career_page_url=career_page_url,
+            page_text=page_text,
+            job_cards=job_cards,
+        )
+
+        raw["job_seeds"] = job_seeds
+
+    except Exception as exc:
+        raw["error"] = str(exc)
+        print(f"[ERROR] Failed career page {career_page_url}: {exc}")
+        return rows, raw
+    finally:
+        page.close()
+
+    job_seeds = job_seeds[:MAX_JOB_LINKS_PER_COMPANY]
+
+    for seed in job_seeds:
+        job_data = open_job_page_and_extract(context, client, company_domain, seed)
+
+        job_title = str(job_data.get("job_title") or "").strip()
+        if not job_title:
+            continue
+
+        company_name = str(job_data.get("company_name") or "").strip()
+        job_url = normalize_url(job_data.get("job_url") or seed.get("job_url") or "")
+
+        if not job_url:
+            job_url = career_page_url
+
+        row = {
+            "List": "",
+            "source": "playwright + gemini",
+            "company_domain": company_domain,
+            "company_name": company_name,
+            "career_page_url": career_page_url,
+            "job_title": job_title,
+            "job_url": job_url,
+            "job_location": str(job_data.get("job_location") or "").strip(),
+            "job_description": str(job_data.get("job_description") or "").strip(),
+            "job_posted_date": str(job_data.get("job_posted_date") or "").strip(),
+            "job_posted_date_source": str(job_data.get("job_posted_date_source") or "").strip(),
+            "confidence": str(job_data.get("confidence") or "").strip(),
+            "reason": str(job_data.get("reason") or "").strip(),
+            "checked_at_utc": checked_at,
+        }
+
+        if should_remove_job(row, ref):
+            continue
+
+        row["List"] = assign_list_value(company_domain, company_name, ref)
+
+        rows.append(row)
+        raw["jobs"].append(row)
+
+        if len(rows) >= MAX_JOBS_OUTPUT:
+            break
+
+        time.sleep(SLEEP_SECONDS)
+
+    return rows, raw
+
+
+def process_domain_discovery(
+    context,
+    client: genai.Client,
+    domain: str,
+    ref: Dict[str, Any],
+    checked_at: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    career_urls = find_career_pages_from_domain(context, domain)
+
+    all_rows = []
+    raw_items = []
+
+    for career_url in career_urls[:5]:
+        rows, raw = process_career_page(
+            context=context,
+            client=client,
+            company_domain=domain,
+            career_page_url=career_url,
+            ref=ref,
+            checked_at=checked_at,
+        )
+
+        all_rows.extend(rows)
+        raw_items.append(raw)
+
+        if all_rows:
+            break
+
+        time.sleep(SLEEP_SECONDS)
+
+    return all_rows, raw_items
+
+
+# =========================================================
+# OUTPUT
+# =========================================================
 
 def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
@@ -629,68 +1103,9 @@ def write_json(path: Path, data: Any) -> None:
     )
 
 
-def process_company(
-    client: genai.Client,
-    domain: str,
-    pages: List[Dict[str, str]],
-    successful_urls: List[str],
-    ref: Dict[str, Any],
-    checked_at: str,
-) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    rows = []
-
-    company_raw = {
-        "company_domain": domain,
-        "career_pages_checked": successful_urls,
-        "jobs": [],
-        "error": "",
-    }
-
-    try:
-        jobs = extract_jobs_with_gemini(client, domain, pages)
-    except Exception as exc:
-        print(f"[ERROR] Gemini failed for {domain}: {exc}")
-        company_raw["error"] = str(exc)
-        return rows, company_raw
-
-    for job in jobs:
-        company_name = str(job.get("company_name") or "").strip()
-        job_title = str(job.get("job_title") or "").strip()
-        job_url = normalize_url(job.get("job_url"))
-        job_location = str(job.get("job_location") or "").strip()
-        confidence = str(job.get("confidence") or "").strip()
-        reason = str(job.get("reason") or "").strip()
-
-        if not job_title:
-            continue
-
-        if not job_url and successful_urls:
-            job_url = successful_urls[0]
-
-        row = {
-            "List": "",
-            "source": "gemini direct career page" if COMPANIES_CAREER_PAGES_CSV.exists() else "gemini company website",
-            "company_domain": domain,
-            "company_name": company_name,
-            "career_page_url": successful_urls[0] if successful_urls else "",
-            "job_title": job_title,
-            "job_url": job_url,
-            "job_location": job_location,
-            "confidence": confidence,
-            "reason": reason,
-            "checked_at_utc": checked_at,
-        }
-
-        if should_remove_job(row, ref):
-            continue
-
-        row["List"] = assign_list_value(domain, company_name, ref)
-
-        rows.append(row)
-        company_raw["jobs"].append(row)
-
-    return rows, company_raw
-
+# =========================================================
+# MAIN
+# =========================================================
 
 def main() -> None:
     if not GEMINI_API_KEY:
@@ -702,64 +1117,73 @@ def main() -> None:
     ref = load_reference_data()
     checked_at = datetime.now(timezone.utc).isoformat()
 
-    direct_pages = read_direct_career_pages()
     all_rows = []
     raw_results = []
 
-    if direct_pages:
-        print("[INFO] Using companies_career_pages.csv direct career page mode.")
+    direct_pages = read_direct_career_pages()
 
-        for index, item in enumerate(direct_pages, start=1):
-            domain = item["company_domain"]
-            career_page = item["career_page"]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 900},
+        )
 
-            print(f"\n[INFO] Career page {index}/{len(direct_pages)}: {career_page}")
+        if direct_pages:
+            print("[INFO] Using companies_career_pages.csv direct career page mode.")
 
-            pages, successful_urls = collect_career_page_text_from_direct_url(domain, career_page)
+            for index, item in enumerate(direct_pages, start=1):
+                if len(all_rows) >= MAX_JOBS_OUTPUT:
+                    break
 
-            rows, company_raw = process_company(
-                client=client,
-                domain=domain,
-                pages=pages,
-                successful_urls=successful_urls,
-                ref=ref,
-                checked_at=checked_at,
-            )
+                domain = item["company_domain"]
+                career_page = item["career_page"]
 
-            all_rows.extend(rows)
-            raw_results.append(company_raw)
+                print(f"\n[INFO] Career page {index}/{len(direct_pages)}: {career_page}")
 
-            if len(all_rows) >= MAX_JOBS_OUTPUT:
-                break
+                rows, raw = process_career_page(
+                    context=context,
+                    client=client,
+                    company_domain=domain,
+                    career_page_url=career_page,
+                    ref=ref,
+                    checked_at=checked_at,
+                )
 
-            time.sleep(SLEEP_SECONDS)
+                all_rows.extend(rows)
+                raw_results.append(raw)
 
-    else:
-        print("[INFO] Using companies.csv domain discovery mode.")
+                time.sleep(SLEEP_SECONDS)
 
-        domains = read_company_domains()
+        else:
+            print("[INFO] Using companies.csv domain discovery mode.")
+            domains = read_company_domains()
 
-        for index, domain in enumerate(domains, start=1):
-            print(f"\n[INFO] Company {index}/{len(domains)}: {domain}")
+            for index, domain in enumerate(domains, start=1):
+                if len(all_rows) >= MAX_JOBS_OUTPUT:
+                    break
 
-            pages, successful_urls = collect_career_page_text_from_domain(domain)
+                print(f"\n[INFO] Company {index}/{len(domains)}: {domain}")
 
-            rows, company_raw = process_company(
-                client=client,
-                domain=domain,
-                pages=pages,
-                successful_urls=successful_urls,
-                ref=ref,
-                checked_at=checked_at,
-            )
+                rows, raw_items = process_domain_discovery(
+                    context=context,
+                    client=client,
+                    domain=domain,
+                    ref=ref,
+                    checked_at=checked_at,
+                )
 
-            all_rows.extend(rows)
-            raw_results.append(company_raw)
+                all_rows.extend(rows)
+                raw_results.extend(raw_items)
 
-            if len(all_rows) >= MAX_JOBS_OUTPUT:
-                break
+                time.sleep(SLEEP_SECONDS)
 
-            time.sleep(SLEEP_SECONDS)
+        context.close()
+        browser.close()
 
     all_rows = dedupe_rows(all_rows)
     all_rows = all_rows[:MAX_JOBS_OUTPUT]

@@ -42,6 +42,7 @@ IRRELEVANT_NAMES_CSV = Path("irrelevant names.csv")
 OUTPUT_DIR = Path("output")
 OUTPUT_CSV_PATH = OUTPUT_DIR / "gemini_company_jobs.csv"
 RAW_JSON_PATH = OUTPUT_DIR / "raw_gemini_company_jobs.json"
+SKIPPED_JOBS_CSV_PATH = OUTPUT_DIR / "skipped_jobs_debug.csv"
 
 FIELDNAMES = [
     "List",
@@ -53,10 +54,22 @@ FIELDNAMES = [
     "job_url",
     "job_location",
     "job_description",
+    "job_description_length",
     "job_posted_date",
     "job_posted_date_source",
     "confidence",
     "reason",
+    "checked_at_utc",
+]
+
+SKIPPED_FIELDNAMES = [
+    "company_domain",
+    "career_page_url",
+    "seed_job_title",
+    "seed_job_url",
+    "final_job_url",
+    "skip_reason",
+    "job_page_text_sample",
     "checked_at_utc",
 ]
 
@@ -92,6 +105,33 @@ JOB_LINK_KEYWORDS = [
     "view job",
     "read more",
     "learn more",
+]
+
+JOB_URL_PATTERNS = [
+    "/jobs/",
+    "/job/",
+    "/careers/",
+    "/career/",
+    "/vacancies/",
+    "/vacancy/",
+    "/roles/",
+    "/role/",
+    "/openings/",
+    "/positions/",
+    "greenhouse.io",
+    "lever.co",
+    "workable.com",
+    "ashbyhq.com",
+    "smartrecruiters.com",
+    "pinpointhq.com",
+    "bamboohr.com",
+    "recruitee.com",
+    "teamtailor.com",
+    "workdayjobs.com",
+    "myworkdayjobs.com",
+    "icims.com",
+    "jobvite.com",
+    "personio.com",
 ]
 
 NON_JOB_LINK_KEYWORDS = [
@@ -187,7 +227,6 @@ def clean_page_text(text: str, max_chars: int = 70000) -> str:
 def clean_job_description(text: str) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
 
-    # Remove common cookie/navigation noise, but keep the full role content.
     noise_patterns = [
         r"(?i)cookie policy.*?(accept all|reject all|manage preferences)",
         r"(?i)we use cookies.*?(accept|reject|manage)",
@@ -218,7 +257,6 @@ def has_real_job_description(text: str) -> bool:
     if is_closed_or_invalid_page(cleaned):
         return False
 
-    # Require at least some role-like content.
     role_signals = [
         "responsibilities",
         "requirements",
@@ -238,12 +276,18 @@ def has_real_job_description(text: str) -> bool:
     return any(signal in normalized for signal in role_signals)
 
 
-def safe_json(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
-    return str(value)
+def is_likely_job_url(url: str, text: str = "", nearby_text: str = "") -> bool:
+    combined = normalize_text(f"{url} {text} {nearby_text}")
+    if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
+        return False
+
+    if any(pattern in combined for pattern in JOB_URL_PATTERNS):
+        return True
+
+    if any(keyword in combined for keyword in JOB_LINK_KEYWORDS):
+        return True
+
+    return False
 
 
 # =========================================================
@@ -528,9 +572,9 @@ def rendered_html(page) -> str:
         return ""
 
 
-def extract_nearby_job_cards(page) -> List[Dict[str, str]]:
+def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
     """
-    Extract visible link/card context from rendered page.
+    Extracts visible link/card context from rendered page.
     This helps Gemini match job titles to real URLs.
     """
     try:
@@ -540,13 +584,13 @@ def extract_nearby_job_cards(page) -> List[Dict[str, str]]:
               const links = Array.from(document.querySelectorAll('a[href]'));
               return links.map(a => {
                 let container = a;
-                for (let i = 0; i < 6; i++) {
+                for (let i = 0; i < 7; i++) {
                   if (container.parentElement) container = container.parentElement;
                 }
                 return {
                   href: a.href,
                   link_text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
-                  nearby_text: (container.innerText || '').trim().slice(0, 1500)
+                  nearby_text: (container.innerText || '').trim().slice(0, 1800)
                 };
               });
             }
@@ -560,14 +604,16 @@ def extract_nearby_job_cards(page) -> List[Dict[str, str]]:
 
     for card in cards:
         href = normalize_url(card.get("href", ""))
-        nearby_text = clean_page_text(card.get("nearby_text", ""), max_chars=1500)
+        nearby_text = clean_page_text(card.get("nearby_text", ""), max_chars=1800)
         link_text = str(card.get("link_text") or "").strip()
 
         if not href or not nearby_text:
             continue
 
-        combined = normalize_text(f"{href} {link_text} {nearby_text}")
-        if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
+        if not same_or_subdomain(href, company_domain):
+            continue
+
+        if not is_likely_job_url(href, link_text, nearby_text):
             continue
 
         key = f"{href}|{nearby_text[:100]}"
@@ -581,7 +627,7 @@ def extract_nearby_job_cards(page) -> List[Dict[str, str]]:
             "nearby_text": nearby_text,
         })
 
-    return cleaned[:120]
+    return cleaned[:150]
 
 
 def extract_rendered_links(page, company_domain: str, job_like_only: bool = False) -> List[Dict[str, str]]:
@@ -617,7 +663,7 @@ def extract_rendered_links(page, company_domain: str, job_like_only: bool = Fals
         if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
             continue
 
-        if job_like_only and not any(keyword in combined for keyword in JOB_LINK_KEYWORDS):
+        if job_like_only and not is_likely_job_url(href, text, outer_html):
             continue
 
         if href in seen:
@@ -771,7 +817,7 @@ def first_structured_date(html: str) -> tuple[str, str]:
 # =========================================================
 
 def build_career_page_prompt(company_domain: str, career_page_url: str, page_text: str, job_cards: List[Dict[str, str]]) -> str:
-    cards_text = json.dumps(job_cards[:120], ensure_ascii=False, indent=2)
+    cards_text = json.dumps(job_cards[:150], ensure_ascii=False, indent=2)
 
     return f"""
 You are extracting currently open job vacancies from a rendered company career page.
@@ -851,8 +897,7 @@ Rules:
   - If using visible text, return "visible_text".
   - If no date exists, return empty string.
 - Do NOT summarize job_description.
-- job_description should be the full cleaned job description text from the job page, preserving the main sections as much as possible.
-- Remove navigation/header/footer/cookie text if obvious.
+- The script will save the full job description itself, so you do not need to return job_description.
 - confidence should be "high", "medium", or "low".
 - reason should be short.
 
@@ -1012,8 +1057,8 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
         "job_title": str(enriched.get("job_title") or job_seed.get("job_title") or "").strip(),
         "job_url": normalize_url(enriched.get("job_url") or final_url or seed_url),
         "job_location": str(enriched.get("job_location") or job_seed.get("job_location") or "").strip(),
-        # Full description comes from Playwright page text, not from Gemini summary.
         "job_description": cleaned_description,
+        "job_description_length": len(cleaned_description),
         "job_posted_date": str(enriched.get("job_posted_date") or structured_date or "").strip(),
         "job_posted_date_source": str(enriched.get("job_posted_date_source") or structured_source or "").strip(),
         "confidence": str(enriched.get("confidence") or job_seed.get("confidence") or "medium").strip(),
@@ -1025,6 +1070,28 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
 # CAREER PAGE PROCESSING
 # =========================================================
 
+def add_skipped_job(
+    skipped_jobs: List[Dict[str, Any]],
+    company_domain: str,
+    career_page_url: str,
+    seed: Dict[str, Any],
+    reason: str,
+    checked_at: str,
+    final_job_url: str = "",
+    job_page_text_sample: str = "",
+) -> None:
+    skipped_jobs.append({
+        "company_domain": company_domain,
+        "career_page_url": career_page_url,
+        "seed_job_title": str(seed.get("job_title") or ""),
+        "seed_job_url": str(seed.get("job_url") or ""),
+        "final_job_url": final_job_url,
+        "skip_reason": reason,
+        "job_page_text_sample": job_page_text_sample,
+        "checked_at_utc": checked_at,
+    })
+
+
 def process_career_page(
     context,
     client: genai.Client,
@@ -1032,6 +1099,7 @@ def process_career_page(
     career_page_url: str,
     ref: Dict[str, Any],
     checked_at: str,
+    skipped_jobs_debug: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     rows = []
 
@@ -1054,7 +1122,7 @@ def process_career_page(
             return rows, raw
 
         page_text = rendered_page_text(page, max_chars=90000)
-        job_cards = extract_nearby_job_cards(page)
+        job_cards = extract_nearby_job_cards(page, company_domain)
 
         raw["career_page_text_sample"] = page_text[:5000]
         raw["job_cards_sample"] = job_cards[:30]
@@ -1082,30 +1150,71 @@ def process_career_page(
         job_data = open_job_page_and_extract(context, client, company_domain, seed)
 
         if not job_data.get("is_valid_open_job"):
-            raw["skipped_jobs"].append({
+            reason = job_data.get("invalid_reason", "Invalid or closed job page.")
+            final_job_url = job_data.get("job_url", seed.get("job_url", ""))
+            sample = job_data.get("job_page_text_sample", "")
+
+            raw_skip = {
                 "seed": seed,
-                "reason": job_data.get("invalid_reason", "Invalid or closed job page."),
-                "job_url": job_data.get("job_url", seed.get("job_url", "")),
-            })
+                "reason": reason,
+                "job_url": final_job_url,
+                "job_page_text_sample": sample,
+            }
+            raw["skipped_jobs"].append(raw_skip)
+
+            add_skipped_job(
+                skipped_jobs=skipped_jobs_debug,
+                company_domain=company_domain,
+                career_page_url=career_page_url,
+                seed=seed,
+                reason=reason,
+                checked_at=checked_at,
+                final_job_url=final_job_url,
+                job_page_text_sample=sample,
+            )
             continue
 
         job_title = str(job_data.get("job_title") or "").strip()
         if not job_title:
+            reason = "Missing job title after job page extraction."
+            final_job_url = job_data.get("job_url", seed.get("job_url", ""))
+
             raw["skipped_jobs"].append({
                 "seed": seed,
-                "reason": "Missing job title after job page extraction.",
-                "job_url": job_data.get("job_url", seed.get("job_url", "")),
+                "reason": reason,
+                "job_url": final_job_url,
             })
+
+            add_skipped_job(
+                skipped_jobs=skipped_jobs_debug,
+                company_domain=company_domain,
+                career_page_url=career_page_url,
+                seed=seed,
+                reason=reason,
+                checked_at=checked_at,
+                final_job_url=final_job_url,
+            )
             continue
 
         company_name = str(job_data.get("company_name") or "").strip()
         job_url = normalize_url(job_data.get("job_url") or seed.get("job_url") or "")
 
         if not job_url:
+            reason = "Missing job URL."
+
             raw["skipped_jobs"].append({
                 "seed": seed,
-                "reason": "Missing job URL.",
+                "reason": reason,
             })
+
+            add_skipped_job(
+                skipped_jobs=skipped_jobs_debug,
+                company_domain=company_domain,
+                career_page_url=career_page_url,
+                seed=seed,
+                reason=reason,
+                checked_at=checked_at,
+            )
             continue
 
         row = {
@@ -1118,6 +1227,7 @@ def process_career_page(
             "job_url": job_url,
             "job_location": str(job_data.get("job_location") or "").strip(),
             "job_description": str(job_data.get("job_description") or "").strip(),
+            "job_description_length": int(job_data.get("job_description_length") or len(str(job_data.get("job_description") or ""))),
             "job_posted_date": str(job_data.get("job_posted_date") or "").strip(),
             "job_posted_date_source": str(job_data.get("job_posted_date_source") or "").strip(),
             "confidence": str(job_data.get("confidence") or "").strip(),
@@ -1126,19 +1236,45 @@ def process_career_page(
         }
 
         if not has_real_job_description(row["job_description"]):
+            reason = "Final row removed because job_description is missing/too short/invalid."
+
             raw["skipped_jobs"].append({
                 "seed": seed,
-                "reason": "Final row removed because job_description is missing/too short/invalid.",
+                "reason": reason,
                 "job_url": job_url,
             })
+
+            add_skipped_job(
+                skipped_jobs=skipped_jobs_debug,
+                company_domain=company_domain,
+                career_page_url=career_page_url,
+                seed=seed,
+                reason=reason,
+                checked_at=checked_at,
+                final_job_url=job_url,
+                job_page_text_sample=row["job_description"][:1000],
+            )
             continue
 
         if should_remove_job(row, ref):
+            reason = "Removed by blacklist/customers/current jobs/irrelevant names logic."
+
             raw["skipped_jobs"].append({
                 "seed": seed,
-                "reason": "Removed by blacklist/customers/current jobs/irrelevant names logic.",
+                "reason": reason,
                 "job_url": job_url,
             })
+
+            add_skipped_job(
+                skipped_jobs=skipped_jobs_debug,
+                company_domain=company_domain,
+                career_page_url=career_page_url,
+                seed=seed,
+                reason=reason,
+                checked_at=checked_at,
+                final_job_url=job_url,
+                job_page_text_sample=row["job_description"][:1000],
+            )
             continue
 
         row["List"] = assign_list_value(company_domain, company_name, ref)
@@ -1160,6 +1296,7 @@ def process_domain_discovery(
     domain: str,
     ref: Dict[str, Any],
     checked_at: str,
+    skipped_jobs_debug: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     career_urls = find_career_pages_from_domain(context, domain)
 
@@ -1174,6 +1311,7 @@ def process_domain_discovery(
             career_page_url=career_url,
             ref=ref,
             checked_at=checked_at,
+            skipped_jobs_debug=skipped_jobs_debug,
         )
 
         all_rows.extend(rows)
@@ -1207,9 +1345,9 @@ def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return output
 
 
-def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1237,6 +1375,7 @@ def main() -> None:
 
     all_rows = []
     raw_results = []
+    skipped_jobs_debug = []
 
     direct_pages = read_direct_career_pages()
 
@@ -1270,6 +1409,7 @@ def main() -> None:
                     career_page_url=career_page,
                     ref=ref,
                     checked_at=checked_at,
+                    skipped_jobs_debug=skipped_jobs_debug,
                 )
 
                 all_rows.extend(rows)
@@ -1293,6 +1433,7 @@ def main() -> None:
                     domain=domain,
                     ref=ref,
                     checked_at=checked_at,
+                    skipped_jobs_debug=skipped_jobs_debug,
                 )
 
                 all_rows.extend(rows)
@@ -1306,11 +1447,13 @@ def main() -> None:
     all_rows = dedupe_rows(all_rows)
     all_rows = all_rows[:MAX_JOBS_OUTPUT]
 
-    write_csv(OUTPUT_CSV_PATH, all_rows)
+    write_csv(OUTPUT_CSV_PATH, all_rows, FIELDNAMES)
+    write_csv(SKIPPED_JOBS_CSV_PATH, skipped_jobs_debug, SKIPPED_FIELDNAMES)
     write_json(RAW_JSON_PATH, raw_results)
 
     print("\n[DONE]")
     print(f"Jobs saved: {len(all_rows)} -> {OUTPUT_CSV_PATH}")
+    print(f"Skipped jobs debug saved: {len(skipped_jobs_debug)} -> {SKIPPED_JOBS_CSV_PATH}")
     print(f"Raw JSON -> {RAW_JSON_PATH}")
 
 

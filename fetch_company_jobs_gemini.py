@@ -23,7 +23,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "5"))
 MAX_JOBS_OUTPUT = int(os.getenv("MAX_JOBS_OUTPUT", "500"))
 MAX_JOB_LINKS_PER_COMPANY = int(os.getenv("MAX_JOB_LINKS_PER_COMPANY", "50"))
-MAX_SECONDARY_PAGES_PER_COMPANY = int(os.getenv("MAX_SECONDARY_PAGES_PER_COMPANY", "5"))
+MAX_SECONDARY_PAGES_PER_COMPANY = int(os.getenv("MAX_SECONDARY_PAGES_PER_COMPANY", "8"))
 
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "45"))
 SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
@@ -124,6 +124,9 @@ NEXT_PAGE_KEYWORDS = [
     "find jobs",
     "opportunities",
     "join our team",
+    "our vacancies",
+    "explore roles",
+    "all jobs",
 ]
 
 JOB_URL_PATTERNS = [
@@ -209,6 +212,19 @@ CLOSED_OR_INVALID_JOB_SIGNALS = [
     "expired vacancy",
     "sorry, this vacancy is no longer available",
     "the page you are looking for could not be found",
+]
+
+ZERO_JOB_RETRY_SIGNALS = [
+    "vacancies",
+    "open positions",
+    "search jobs",
+    "view jobs",
+    "loading",
+    "apply now",
+    "open roles",
+    "job openings",
+    "join our team",
+    "current vacancies",
 ]
 
 
@@ -346,6 +362,11 @@ def is_likely_next_page(url: str, text: str = "", nearby_text: str = "") -> bool
         return True
 
     return False
+
+
+def has_zero_job_retry_signal(text: str) -> bool:
+    normalized = normalize_text(text)
+    return any(signal in normalized for signal in ZERO_JOB_RETRY_SIGNALS)
 
 
 # =========================================================
@@ -632,12 +653,9 @@ def rendered_html(page) -> str:
 
 def expand_page(page) -> None:
     try:
-        page.mouse.wheel(0, 1500)
-        time.sleep(0.5)
-        page.mouse.wheel(0, 1500)
-        time.sleep(0.5)
-        page.mouse.wheel(0, 3000)
-        time.sleep(0.5)
+        for amount in (1200, 1800, 2500, 3500):
+            page.mouse.wheel(0, amount)
+            time.sleep(0.4)
     except Exception:
         pass
 
@@ -653,13 +671,16 @@ def expand_page(page) -> None:
         "View all jobs",
         "Current vacancies",
         "Join our team",
+        "Search jobs",
+        "Find jobs",
+        "Open positions - Vacancies",
     ]
 
     for text in click_texts:
         try:
             locator = page.get_by_text(text, exact=False).first
-            if locator.count() > 0 and locator.is_visible(timeout=1000):
-                locator.click(timeout=2000)
+            if locator.count() > 0 and locator.is_visible(timeout=800):
+                locator.click(timeout=1500)
                 time.sleep(1)
         except Exception:
             continue
@@ -673,13 +694,13 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
               const links = Array.from(document.querySelectorAll('a[href]'));
               return links.map(a => {
                 let container = a;
-                for (let i = 0; i < 7; i++) {
+                for (let i = 0; i < 8; i++) {
                   if (container.parentElement) container = container.parentElement;
                 }
                 return {
                   href: a.href,
                   link_text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
-                  nearby_text: (container.innerText || '').trim().slice(0, 1800)
+                  nearby_text: (container.innerText || '').trim().slice(0, 2200)
                 };
               });
             }
@@ -693,20 +714,19 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
 
     for card in cards:
         href = normalize_url(card.get("href", ""))
-        nearby_text = clean_page_text(card.get("nearby_text", ""), max_chars=1800)
+        nearby_text = clean_page_text(card.get("nearby_text", ""), max_chars=2200)
         link_text = str(card.get("link_text") or "").strip()
 
         if not href or not nearby_text:
             continue
 
-        # Allow same-domain pages and external ATS pages
         if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
             continue
 
         if not is_likely_job_url(href, link_text, nearby_text):
             continue
 
-        key = f"{href}|{nearby_text[:100]}"
+        key = f"{href}|{nearby_text[:120]}"
         if key in seen:
             continue
         seen.add(key)
@@ -717,18 +737,21 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
             "nearby_text": nearby_text,
         })
 
-    return cleaned[:150]
+    return cleaned[:180]
 
 
 def extract_next_page_candidates(page, company_domain: str) -> List[str]:
     try:
         links = page.evaluate(
             """
-            () => Array.from(document.querySelectorAll('a[href]')).map(a => ({
-                text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
-                href: a.href,
-                outer_html: a.outerHTML.slice(0, 500)
-            }))
+            () => Array.from(document.querySelectorAll('a[href], button')).map(el => {
+                const href = el.tagName.toLowerCase() === 'a' ? el.href : '';
+                return {
+                    text: (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim(),
+                    href: href,
+                    outer_html: el.outerHTML.slice(0, 700)
+                };
+            })
             """
         )
     except Exception:
@@ -758,7 +781,7 @@ def extract_next_page_candidates(page, company_domain: str) -> List[str]:
         seen.add(href)
         candidates.append(href)
 
-    return candidates[:20]
+    return candidates[:30]
 
 
 def find_career_pages_from_domain(context, domain: str) -> List[str]:
@@ -899,7 +922,7 @@ def first_structured_date(html: str) -> tuple[str, str]:
 # =========================================================
 
 def build_career_page_prompt(company_domain: str, career_page_url: str, page_text: str, job_cards: List[Dict[str, str]]) -> str:
-    cards_text = json.dumps(job_cards[:150], ensure_ascii=False, indent=2)
+    cards_text = json.dumps(job_cards[:180], ensure_ascii=False, indent=2)
 
     return f"""
 You are extracting currently open job vacancies from a rendered company career page.
@@ -1184,6 +1207,7 @@ def process_single_rendered_page(
     ref: Dict[str, Any],
     checked_at: str,
     skipped_jobs_debug: List[Dict[str, Any]],
+    force_deeper: bool = False,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
     rows = []
 
@@ -1196,6 +1220,7 @@ def process_single_rendered_page(
         "skipped_jobs": [],
         "next_pages": [],
         "error": "",
+        "force_deeper": force_deeper,
     }
 
     page = context.new_page()
@@ -1208,12 +1233,16 @@ def process_single_rendered_page(
             return rows, raw, []
 
         expand_page(page)
+        if force_deeper:
+            expand_page(page)
+            time.sleep(1)
+
         page_text = rendered_page_text(page, max_chars=90000)
         job_cards = extract_nearby_job_cards(page, company_domain)
         next_pages = extract_next_page_candidates(page, company_domain)
 
         raw["career_page_text_sample"] = page_text[:5000]
-        raw["job_cards_sample"] = job_cards[:30]
+        raw["job_cards_sample"] = job_cards[:40]
         raw["next_pages"] = next_pages[:20]
 
         job_seeds = extract_jobs_from_career_page_with_gemini(
@@ -1390,6 +1419,7 @@ def process_career_page(
     """
     Process the provided career page first.
     If that page has no jobs, explore likely secondary pages linked from it.
+    If still no jobs and the page shows signals that jobs likely exist, do a stronger second pass.
     """
     all_rows = []
     raw_items = []
@@ -1413,6 +1443,7 @@ def process_career_page(
             ref=ref,
             checked_at=checked_at,
             skipped_jobs_debug=skipped_jobs_debug,
+            force_deeper=False,
         )
 
         raw_items.append(raw)
@@ -1420,6 +1451,34 @@ def process_career_page(
 
         if rows:
             break
+
+        current_text_sample = raw.get("career_page_text_sample", "")
+        should_retry_deeper = has_zero_job_retry_signal(current_text_sample) or len(next_pages) > 0
+
+        if should_retry_deeper:
+            retry_rows, retry_raw, retry_next_pages = process_single_rendered_page(
+                context=context,
+                client=client,
+                company_domain=company_domain,
+                root_career_page_url=career_page_url,
+                page_url=current_page_url,
+                ref=ref,
+                checked_at=checked_at,
+                skipped_jobs_debug=skipped_jobs_debug,
+                force_deeper=True,
+            )
+
+            retry_raw["retry_reason"] = "Zero jobs found on first pass; stronger retry executed."
+            raw_items.append(retry_raw)
+            all_rows.extend(retry_rows)
+
+            if retry_rows:
+                break
+
+            for next_page in retry_next_pages:
+                next_page = normalize_url(next_page)
+                if next_page and next_page not in visited and next_page not in queue:
+                    queue.append(next_page)
 
         for next_page in next_pages:
             next_page = normalize_url(next_page)

@@ -329,12 +329,60 @@ def is_closed_or_invalid_page(text: str) -> bool:
     return any(signal in normalized for signal in CLOSED_OR_INVALID_JOB_SIGNALS)
 
 
+def is_apply_only_page(text: str) -> bool:
+    normalized = normalize_text(text)
+
+    if not normalized:
+        return True
+
+    strong_apply_form_signals = [
+        "apply for this job",
+        "submit application",
+        "attach your file",
+        "attach your file(s)",
+        "drag and drop",
+        "maximum file size",
+        "first name",
+        "last name",
+        "email address",
+        "powered by",
+        "report this job",
+    ]
+
+    matched = sum(1 for signal in strong_apply_form_signals if signal in normalized)
+
+    real_description_signals = [
+        "about the role",
+        "the role",
+        "responsibilities",
+        "requirements",
+        "about you",
+        "what you will do",
+        "what you'll do",
+        "key responsibilities",
+        "skills and experience",
+        "experience required",
+        "qualifications",
+        "benefits",
+    ]
+
+    has_real_content = any(signal in normalized for signal in real_description_signals)
+
+    if matched >= 4 and not has_real_content:
+        return True
+
+    return False
+
+
 def has_real_job_description(text: str) -> bool:
     cleaned = clean_job_description(text)
     if len(cleaned) < MIN_JOB_DESCRIPTION_CHARS:
         return False
 
     if is_closed_or_invalid_page(cleaned):
+        return False
+
+    if is_apply_only_page(cleaned):
         return False
 
     role_signals = [
@@ -349,7 +397,9 @@ def has_real_job_description(text: str) -> bool:
         "key responsibilities",
         "skills",
         "experience",
-        "apply",
+        "about you",
+        "qualifications",
+        "benefits",
     ]
 
     normalized = normalize_text(cleaned)
@@ -972,7 +1022,6 @@ def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]
                         })
             continue
 
-        # Optional click fallback for real button-only sites
         popup_page = None
         previous_url = normalize_url(page.url)
 
@@ -1382,7 +1431,7 @@ Rules:
 - No markdown.
 - Do not invent information.
 - Extract only what is explicitly present in the job page text or structured posted date fields.
-- If the page says page not found, job not found, vacancy unavailable, expired, closed, or does not contain a real job description, return:
+- If the page says page not found, job not found, vacancy unavailable, expired, closed, apply-only, or does not contain a real job description, return:
   {{"is_valid_open_job": false}}
 - Otherwise return:
   {{"is_valid_open_job": true, ...fields...}}
@@ -1524,6 +1573,14 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
     structured_date, structured_source = first_structured_date(html)
     cleaned_description = clean_job_description(page_text)
 
+    if is_apply_only_page(cleaned_description):
+        return {
+            "is_valid_open_job": False,
+            "invalid_reason": "Job page is only an apply form and does not contain a real job description.",
+            "job_url": final_url or seed_url,
+            "job_page_text_sample": page_text[:1000],
+        }
+
     if not has_real_job_description(cleaned_description):
         return {
             "is_valid_open_job": False,
@@ -1653,7 +1710,6 @@ def process_single_rendered_page(
             if not is_blocked_external_board(str(seed.get("job_url") or ""))
         ]
 
-        # extra deterministic patch in case Gemini still misses URLs
         job_seeds = patch_missing_seed_urls(job_seeds, job_cards, company_domain)
 
         raw["job_seeds"] = job_seeds

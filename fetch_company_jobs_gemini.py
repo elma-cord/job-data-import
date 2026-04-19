@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Set
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from google import genai
@@ -101,9 +101,16 @@ JOB_LINK_KEYWORDS = [
     "opening",
     "openings",
     "apply",
+    "apply now",
     "view vacancy",
+    "view vacancies",
     "view role",
+    "view roles",
     "view job",
+    "view jobs",
+    "view details",
+    "view details / apply",
+    "details",
     "read more",
     "learn more",
 ]
@@ -139,6 +146,9 @@ JOB_URL_PATTERNS = [
     "/role/",
     "/openings/",
     "/positions/",
+    "/position/",
+    "/careers/",
+    "/career/",
     "/vacancyinformation",
     "greenhouse.io",
     "lever.co",
@@ -352,7 +362,10 @@ def is_ats_url(url: str) -> bool:
 
 
 def is_blocked_external_board(url: str) -> bool:
-    host = normalize_domain(urlparse(url).netloc)
+    try:
+        host = normalize_domain(urlparse(url).netloc)
+    except Exception:
+        return False
     return any(host == domain or host.endswith("." + domain) for domain in BLOCKED_EXTERNAL_JOB_BOARDS)
 
 
@@ -394,6 +407,111 @@ def is_likely_next_page(url: str, text: str = "", nearby_text: str = "") -> bool
 def has_zero_job_retry_signal(text: str) -> bool:
     normalized = normalize_text(text)
     return any(signal in normalized for signal in ZERO_JOB_RETRY_SIGNALS)
+
+
+def title_similarity_score(a: str, b: str) -> int:
+    a_norm = normalize_text(a)
+    b_norm = normalize_text(b)
+    if not a_norm or not b_norm:
+        return 0
+    if a_norm == b_norm:
+        return 100
+    if a_norm in b_norm or b_norm in a_norm:
+        return 85
+
+    a_tokens = set(re.findall(r"[a-z0-9]+", a_norm))
+    b_tokens = set(re.findall(r"[a-z0-9]+", b_norm))
+    if not a_tokens or not b_tokens:
+        return 0
+
+    overlap = len(a_tokens & b_tokens)
+    if overlap == 0:
+        return 0
+
+    ratio = int((2 * overlap / (len(a_tokens) + len(b_tokens))) * 100)
+    return ratio
+
+
+def extract_headings_from_text(text: str) -> List[str]:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in str(text or "").splitlines()]
+    headings = []
+    for line in lines:
+        if not line:
+            continue
+        if len(line) > 120:
+            continue
+        if re.fullmatch(r"[A-Za-z0-9&,\-–—'()/+. ]{3,120}", line):
+            headings.append(line)
+    return headings[:12]
+
+
+def best_card_match_for_title(job_title: str, job_cards: List[Dict[str, str]], company_domain: str) -> Dict[str, Any]:
+    best: Dict[str, Any] = {}
+    best_score = 0
+    title_norm = normalize_text(job_title)
+
+    for card in job_cards:
+        href = normalize_url(card.get("href", ""))
+        if not href:
+            continue
+        if is_blocked_external_board(href):
+            continue
+        if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
+            continue
+
+        link_text = str(card.get("link_text") or "")
+        nearby_text = str(card.get("nearby_text") or "")
+        card_title = str(card.get("card_title") or "")
+
+        candidate_texts = [card_title, link_text]
+        candidate_texts.extend(extract_headings_from_text(nearby_text))
+
+        local_best = 0
+        for candidate in candidate_texts:
+            local_best = max(local_best, title_similarity_score(title_norm, candidate))
+
+        if title_norm and title_norm in normalize_text(nearby_text):
+            local_best = max(local_best, 92)
+
+        if local_best > best_score:
+            best_score = local_best
+            best = {
+                "href": href,
+                "score": local_best,
+                "card_title": card_title,
+                "link_text": link_text,
+                "nearby_text": nearby_text[:1200],
+            }
+
+    return best
+
+
+def patch_missing_seed_urls(job_seeds: List[Dict[str, Any]], job_cards: List[Dict[str, str]], company_domain: str) -> List[Dict[str, Any]]:
+    patched: List[Dict[str, Any]] = []
+
+    for seed in job_seeds:
+        seed_copy = dict(seed)
+        current_url = normalize_url(seed_copy.get("job_url", ""))
+        title = str(seed_copy.get("job_title") or "").strip()
+
+        if current_url:
+            patched.append(seed_copy)
+            continue
+
+        if not title:
+            patched.append(seed_copy)
+            continue
+
+        best = best_card_match_for_title(title, job_cards, company_domain)
+        if best and best.get("href") and int(best.get("score", 0)) >= 60:
+            seed_copy["job_url"] = best["href"]
+            reason = str(seed_copy.get("reason") or "").strip()
+            patch_note = f"URL patched from page card match ({best.get('score')})."
+            seed_copy["reason"] = f"{reason} {patch_note}".strip()
+
+        patched.append(seed_copy)
+
+    return patched
 
 
 # =========================================================
@@ -701,6 +819,7 @@ def expand_page(page) -> None:
         "Search jobs",
         "Find jobs",
         "Open positions - Vacancies",
+        "View Details / Apply",
     ]
 
     for text in click_texts:
@@ -714,10 +833,6 @@ def expand_page(page) -> None:
 
 
 def extract_button_navigation_candidates(page, company_domain: str) -> List[str]:
-    """
-    Capture URLs hidden in buttons/divs with onclick/data-href/data-url attributes.
-    This is important for pages where Learn more is not a normal anchor.
-    """
     try:
         items = page.evaluate(
             """
@@ -754,6 +869,13 @@ def extract_button_navigation_candidates(page, company_domain: str) -> List[str]
         candidates.extend(url_pattern.findall(onclick))
 
         for raw_url in candidates:
+            raw_url = str(raw_url or "").strip()
+            if not raw_url:
+                continue
+
+            if raw_url.startswith("/"):
+                raw_url = urljoin(page.url, raw_url)
+
             raw_url = normalize_url(raw_url)
             if not raw_url.startswith("http"):
                 continue
@@ -771,112 +893,143 @@ def extract_button_navigation_candidates(page, company_domain: str) -> List[str]
     return urls[:30]
 
 
-def extract_clickthrough_candidates(page, company_domain: str) -> List[str]:
-    """
-    Controlled click-through on visible 'Learn more' / 'View vacancy' type elements.
-    This helps pages like DYW where the real URL appears only after click.
-    """
-    urls = []
+def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]]:
+    cards: List[Dict[str, str]] = []
     seen = set()
 
-    selectors = [
-        "a",
-        "button",
-        "[role='button']",
-    ]
+    try:
+        items = page.evaluate(
+            """
+            () => {
+                const els = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+                return els.map((el, idx) => {
+                    let container = el;
+                    for (let i = 0; i < 5; i++) {
+                        if (container.parentElement) container = container.parentElement;
+                    }
+
+                    const headings = Array.from(container.querySelectorAll('h1,h2,h3,h4,h5,h6,strong,b'))
+                      .map(x => (x.innerText || '').trim())
+                      .filter(Boolean)
+                      .slice(0, 6);
+
+                    return {
+                        index: idx,
+                        tag: el.tagName.toLowerCase(),
+                        text: (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim(),
+                        href: el.href || el.getAttribute('href') || '',
+                        nearby_text: (container.innerText || '').trim().slice(0, 2500),
+                        headings
+                    };
+                });
+            }
+            """
+        )
+    except Exception:
+        items = []
+
     wanted_texts = [
-        "Learn more",
-        "View vacancy",
-        "View role",
-        "View job",
-        "Read more",
-        "Apply",
-        "Apply now",
+        "learn more",
+        "view vacancy",
+        "view role",
+        "view job",
+        "view details",
+        "view details / apply",
+        "read more",
+        "apply",
+        "apply now",
+        "details",
     ]
 
-    for selector in selectors:
+    for item in items[:120]:
+        text = normalize_text(item.get("text", ""))
+        href = str(item.get("href") or "").strip()
+        nearby_text = clean_page_text(item.get("nearby_text", ""), max_chars=2500)
+        headings = item.get("headings") or []
+        card_title = str(headings[0] if headings else "").strip()
+
+        if not text:
+            continue
+
+        if not any(normalize_text(t) in text for t in wanted_texts):
+            continue
+
+        if href:
+            if href.startswith("/"):
+                href = urljoin(page.url, href)
+            href = normalize_url(href)
+            if href.startswith("http") and not is_blocked_external_board(href):
+                if same_or_subdomain(href, company_domain) or is_ats_url(href):
+                    key = f"{href}|{card_title}|href"
+                    if key not in seen:
+                        seen.add(key)
+                        cards.append({
+                            "href": href,
+                            "link_text": item.get("text", ""),
+                            "nearby_text": nearby_text,
+                            "card_title": card_title,
+                            "source": "clickthrough_href",
+                        })
+            continue
+
+        # Optional click fallback for real button-only sites
+        popup_page = None
+        previous_url = normalize_url(page.url)
+
+        def handle_popup(p):
+            nonlocal popup_page
+            popup_page = p
+
         try:
-            locator = page.locator(selector)
-            count = min(locator.count(), 40)
-        except Exception:
-            count = 0
-
-        for i in range(count):
-            try:
-                element = locator.nth(i)
-                if not element.is_visible(timeout=300):
-                    continue
-                text = normalize_text(element.inner_text(timeout=300))
-                if not any(normalize_text(t) in text for t in wanted_texts):
-                    continue
-
-                href = element.get_attribute("href")
-                if href:
-                    href = normalize_url(href)
-                    if href.startswith("http") and not is_blocked_external_board(href):
-                        if same_or_subdomain(href, company_domain) or is_ats_url(href):
-                            if href not in seen:
-                                seen.add(href)
-                                urls.append(href)
-                    continue
-
-                popup_page = None
-                previous_url = normalize_url(page.url)
-
-                def handle_popup(p):
-                    nonlocal popup_page
-                    popup_page = p
-
-                page.once("popup", handle_popup)
-
-                try:
-                    element.click(timeout=1200)
-                    time.sleep(1)
-                except Exception:
-                    continue
-
-                if popup_page:
-                    try:
-                        popup_page.wait_for_load_state("domcontentloaded", timeout=5000)
-                        new_url = normalize_url(popup_page.url)
-                        if new_url and new_url.startswith("http") and not is_blocked_external_board(new_url):
-                            if same_or_subdomain(new_url, company_domain) or is_ats_url(new_url):
-                                if new_url not in seen:
-                                    seen.add(new_url)
-                                    urls.append(new_url)
-                    except Exception:
-                        pass
-                    finally:
-                        try:
-                            popup_page.close()
-                        except Exception:
-                            pass
-                else:
-                    new_url = normalize_url(page.url)
-                    if new_url != previous_url and new_url.startswith("http") and not is_blocked_external_board(new_url):
-                        if same_or_subdomain(new_url, company_domain) or is_ats_url(new_url):
-                            if new_url not in seen:
-                                seen.add(new_url)
-                                urls.append(new_url)
-                    try:
-                        page.go_back(wait_until="domcontentloaded", timeout=5000)
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-
-            except Exception:
+            page.once("popup", handle_popup)
+            locator = page.locator("a, button, [role='button']").nth(int(item.get("index", 0)))
+            if not locator.is_visible(timeout=400):
                 continue
+            locator.click(timeout=1200)
+            time.sleep(1)
+        except Exception:
+            continue
 
-    return urls[:30]
+        new_url = ""
+        try:
+            if popup_page:
+                popup_page.wait_for_load_state("domcontentloaded", timeout=5000)
+                new_url = normalize_url(popup_page.url)
+            else:
+                current_url = normalize_url(page.url)
+                if current_url != previous_url:
+                    new_url = current_url
+        except Exception:
+            new_url = ""
+
+        if new_url and new_url.startswith("http") and not is_blocked_external_board(new_url):
+            if same_or_subdomain(new_url, company_domain) or is_ats_url(new_url):
+                key = f"{new_url}|{card_title}|clicked"
+                if key not in seen:
+                    seen.add(key)
+                    cards.append({
+                        "href": new_url,
+                        "link_text": item.get("text", ""),
+                        "nearby_text": nearby_text,
+                        "card_title": card_title,
+                        "source": "clickthrough_clicked",
+                    })
+
+        try:
+            if popup_page:
+                popup_page.close()
+            else:
+                current_url = normalize_url(page.url)
+                if current_url != previous_url:
+                    page.go_back(wait_until="domcontentloaded", timeout=5000)
+                    time.sleep(0.5)
+        except Exception:
+            pass
+
+    return cards[:40]
 
 
 def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
-    """
-    Build richer cards:
-    - normal anchors
-    - navigation candidates from data-url / onclick
-    - clickthrough candidates from Learn more buttons
-    """
     cards = []
     seen = set()
 
@@ -887,13 +1040,20 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
               const links = Array.from(document.querySelectorAll('a[href]'));
               return links.map(a => {
                 let container = a;
-                for (let i = 0; i < 8; i++) {
+                for (let i = 0; i < 6; i++) {
                   if (container.parentElement) container = container.parentElement;
                 }
+
+                const headings = Array.from(container.querySelectorAll('h1,h2,h3,h4,h5,h6,strong,b'))
+                  .map(x => (x.innerText || '').trim())
+                  .filter(Boolean)
+                  .slice(0, 6);
+
                 return {
                   href: a.href,
                   link_text: (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').trim(),
-                  nearby_text: (container.innerText || '').trim().slice(0, 2200)
+                  nearby_text: (container.innerText || '').trim().slice(0, 2500),
+                  headings
                 };
               });
             }
@@ -904,8 +1064,10 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
 
     for card in anchor_cards:
         href = normalize_url(card.get("href", ""))
-        nearby_text = clean_page_text(card.get("nearby_text", ""), max_chars=2200)
+        nearby_text = clean_page_text(card.get("nearby_text", ""), max_chars=2500)
         link_text = str(card.get("link_text") or "").strip()
+        headings = card.get("headings") or []
+        card_title = str(headings[0] if headings else "").strip()
 
         if not href or not nearby_text:
             continue
@@ -916,7 +1078,7 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
         if not is_likely_job_url(href, link_text, nearby_text):
             continue
 
-        key = f"{href}|{nearby_text[:120]}"
+        key = f"{href}|{card_title}|{nearby_text[:120]}"
         if key in seen:
             continue
         seen.add(key)
@@ -925,6 +1087,8 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
             "href": href,
             "link_text": link_text,
             "nearby_text": nearby_text,
+            "card_title": card_title,
+            "source": "anchor",
         })
 
     page_text_sample = rendered_page_text(page, max_chars=12000)
@@ -938,20 +1102,20 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
             "href": href,
             "link_text": "button-navigation",
             "nearby_text": page_text_sample[:1800],
+            "card_title": "",
+            "source": "button_navigation",
         })
 
-    for href in extract_clickthrough_candidates(page, company_domain):
-        key = f"{href}|clickthrough"
+    for card in extract_clickthrough_cards(page, company_domain):
+        href = normalize_url(card.get("href", ""))
+        card_title = str(card.get("card_title") or "").strip()
+        key = f"{href}|{card_title}|clickthrough"
         if key in seen:
             continue
         seen.add(key)
-        cards.append({
-            "href": href,
-            "link_text": "clickthrough-navigation",
-            "nearby_text": page_text_sample[:1800],
-        })
+        cards.append(card)
 
-    return cards[:220]
+    return cards[:260]
 
 
 def extract_next_page_candidates(page, company_domain: str) -> List[str]:
@@ -1001,8 +1165,9 @@ def extract_next_page_candidates(page, company_domain: str) -> List[str]:
             seen.add(href)
             candidates.append(href)
 
-    for href in extract_clickthrough_candidates(page, company_domain):
-        if href not in seen:
+    for card in extract_clickthrough_cards(page, company_domain):
+        href = normalize_url(card.get("href", ""))
+        if href and href not in seen:
             seen.add(href)
             candidates.append(href)
 
@@ -1166,9 +1331,11 @@ Rules:
 - Do not include closed, expired, unavailable, speculative, or generic talent pool roles unless clearly listed as open.
 - If there are no currently open jobs, return {{"jobs":[]}}.
 - Prefer the most specific job URL from JOB_CARDS when available.
+- JOB_CARDS may contain the exact job detail page URL even when the main page only shows a generic button like "View Details / Apply".
+- If a job title in the page text matches a JOB_CARD nearby_text/card_title, use that JOB_CARD href as job_url.
 - Do not use unrelated external job-board URLs.
 - Do not use the career page URL as job_url if a more specific vacancy/job URL is available.
-- If the job URL is not visible/available, use an empty string.
+- If the exact job detail URL is not available, use an empty string.
 - confidence should be "high", "medium", or "low".
 - reason should be short and explain why the role was extracted.
 
@@ -1291,7 +1458,9 @@ def extract_jobs_from_career_page_with_gemini(
     if not isinstance(jobs, list):
         return []
 
-    return [job for job in jobs if isinstance(job, dict)]
+    jobs = [job for job in jobs if isinstance(job, dict)]
+    jobs = patch_missing_seed_urls(jobs, job_cards, company_domain)
+    return jobs
 
 
 def enrich_job_page_with_gemini(
@@ -1468,7 +1637,7 @@ def process_single_rendered_page(
         next_pages = extract_next_page_candidates(page, company_domain)
 
         raw["career_page_text_sample"] = page_text[:5000]
-        raw["job_cards_sample"] = job_cards[:40]
+        raw["job_cards_sample"] = job_cards[:60]
         raw["next_pages"] = next_pages[:20]
 
         job_seeds = extract_jobs_from_career_page_with_gemini(
@@ -1483,6 +1652,9 @@ def process_single_rendered_page(
             seed for seed in job_seeds
             if not is_blocked_external_board(str(seed.get("job_url") or ""))
         ]
+
+        # extra deterministic patch in case Gemini still misses URLs
+        job_seeds = patch_missing_seed_urls(job_seeds, job_cards, company_domain)
 
         raw["job_seeds"] = job_seeds
 
@@ -1667,10 +1839,6 @@ def process_career_page(
     checked_at: str,
     skipped_jobs_debug: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Process provided career page first.
-    Only use stronger retry/deeper exploration when zero jobs are found.
-    """
     all_rows = []
     raw_items = []
 

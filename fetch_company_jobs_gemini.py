@@ -22,13 +22,13 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 MAX_COMPANIES = int(os.getenv("MAX_COMPANIES", "5"))
 MAX_JOBS_OUTPUT = int(os.getenv("MAX_JOBS_OUTPUT", "500"))
-MAX_JOB_LINKS_PER_COMPANY = int(os.getenv("MAX_JOB_LINKS_PER_COMPANY", "50"))
-MAX_SECONDARY_PAGES_PER_COMPANY = int(os.getenv("MAX_SECONDARY_PAGES_PER_COMPANY", "6"))
+MAX_JOB_LINKS_PER_COMPANY = int(os.getenv("MAX_JOB_LINKS_PER_COMPANY", "150"))
+MAX_SECONDARY_PAGES_PER_COMPANY = int(os.getenv("MAX_SECONDARY_PAGES_PER_COMPANY", "8"))
 
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "45"))
-SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1"))
+SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "0.5"))
 
-MIN_JOB_DESCRIPTION_CHARS = int(os.getenv("MIN_JOB_DESCRIPTION_CHARS", "300"))
+MIN_JOB_DESCRIPTION_CHARS = int(os.getenv("MIN_JOB_DESCRIPTION_CHARS", "220"))
 MAX_JOB_DESCRIPTION_CHARS = int(os.getenv("MAX_JOB_DESCRIPTION_CHARS", "60000"))
 
 COMPANIES_CSV = Path("companies.csv")
@@ -206,7 +206,6 @@ NON_JOB_LINK_KEYWORDS = [
     "cookies",
     "terms",
     "contact",
-    "about",
     "blog",
     "news",
     "login",
@@ -222,9 +221,20 @@ NON_JOB_LINK_KEYWORDS = [
     "policies",
     "legal",
     "accessibility",
-    "modern slavery",
-    "gender pay",
     "sitemap",
+]
+
+EXACT_BAD_URL_FRAGMENTS = [
+    "/privacy-policy",
+    "/privacy",
+    "/cookie-policy",
+    "/cookies",
+    "/terms-and-conditions",
+    "/terms",
+    "/legal",
+    "/accessibility",
+    "/accessibility-statement",
+    "/sitemap",
 ]
 
 CLOSED_OR_INVALID_JOB_SIGNALS = [
@@ -291,6 +301,11 @@ JOB_TITLE_HINTS = [
     "project",
     "data",
     "scientist",
+    "recruiter",
+    "bookkeeper",
+    "warehouse",
+    "electrical",
+    "mechanical",
 ]
 
 ATTACHMENT_EXTENSIONS = [".pdf", ".doc", ".docx"]
@@ -350,8 +365,8 @@ def clean_job_description(text: str) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
 
     noise_patterns = [
-        r"(?i)cookie policy.*?(accept all|reject all|manage preferences)",
-        r"(?i)we use cookies.*?(accept|reject|manage)",
+        r"(?is)cookie policy.*?(accept all|reject all|manage preferences)",
+        r"(?is)we use cookies.*?(accept|reject|manage)",
         r"(?i)skip to content",
         r"(?i)share this job",
     ]
@@ -363,11 +378,15 @@ def clean_job_description(text: str) -> str:
     return text[:MAX_JOB_DESCRIPTION_CHARS]
 
 
+def has_exact_bad_url_fragment(url: str) -> bool:
+    url_norm = normalize_text(url)
+    return any(fragment in url_norm for fragment in EXACT_BAD_URL_FRAGMENTS)
+
+
 def is_closed_or_invalid_page(text: str) -> bool:
     normalized = normalize_text(text)
     if not normalized:
         return True
-
     return any(signal in normalized for signal in CLOSED_OR_INVALID_JOB_SIGNALS)
 
 
@@ -401,13 +420,14 @@ def description_signal_count(text: str) -> int:
         "permanent",
         "hybrid",
         "remote",
+        "hours",
+        "reporting to",
     ]
     return sum(1 for signal in signals if signal in normalized)
 
 
 def is_apply_only_page(text: str) -> bool:
     normalized = normalize_text(text)
-
     if not normalized:
         return True
 
@@ -424,21 +444,16 @@ def is_apply_only_page(text: str) -> bool:
         "phone number",
         "upload cv",
         "upload resume",
-        "powered by",
         "report this job",
     ]
 
     matched = sum(1 for signal in strong_apply_form_signals if signal in normalized)
     desc_count = description_signal_count(normalized)
 
-    # Only treat as apply-only when form signals are strong
-    # AND description content is weak.
-    if matched >= 5 and desc_count <= 1:
+    if matched >= 6 and desc_count <= 1:
         return True
-
-    if matched >= 7 and desc_count <= 2:
+    if matched >= 8 and desc_count <= 2:
         return True
-
     return False
 
 
@@ -446,13 +461,10 @@ def has_real_job_description(text: str) -> bool:
     cleaned = clean_job_description(text)
     if len(cleaned) < MIN_JOB_DESCRIPTION_CHARS:
         return False
-
     if is_closed_or_invalid_page(cleaned):
         return False
-
     if is_apply_only_page(cleaned):
         return False
-
     return description_signal_count(cleaned) >= 2
 
 
@@ -474,67 +486,35 @@ def is_attachment_url(url: str) -> bool:
     return any(url_norm.endswith(ext) or f"{ext}?" in url_norm for ext in ATTACHMENT_EXTENSIONS)
 
 
-def has_bad_url_fragment(url: str) -> bool:
-    url_norm = normalize_text(url)
-    bad_fragments = [
-        "/privacy",
-        "/cookie",
-        "/cookies",
-        "/terms",
-        "/contact",
-        "/about",
-        "/policy",
-        "/policies",
-        "/legal",
-        "/accessibility",
-        "/sitemap",
-        "/modern-slavery",
-        "/gender-pay",
-    ]
-    return any(fragment in url_norm for fragment in bad_fragments)
-
-
 def is_likely_job_url(url: str, text: str = "", nearby_text: str = "") -> bool:
     combined = normalize_text(f"{url} {text} {nearby_text}")
     if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
         return False
-
-    if has_bad_url_fragment(url):
+    if has_exact_bad_url_fragment(url):
         return False
-
     if is_blocked_external_board(url):
         return False
-
     if is_attachment_url(url):
         return False
-
     if any(pattern in combined for pattern in JOB_URL_PATTERNS):
         return True
-
     if any(keyword in combined for keyword in JOB_LINK_KEYWORDS):
         return True
-
     return False
 
 
 def is_likely_next_page(url: str, text: str = "", nearby_text: str = "") -> bool:
     combined = normalize_text(f"{url} {text} {nearby_text}")
-
     if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
         return False
-
-    if has_bad_url_fragment(url):
+    if has_exact_bad_url_fragment(url):
         return False
-
     if is_blocked_external_board(url):
         return False
-
     if is_ats_url(url):
         return True
-
     if any(keyword in combined for keyword in NEXT_PAGE_KEYWORDS):
         return True
-
     return False
 
 
@@ -590,92 +570,6 @@ def looks_like_job_title(text: str) -> bool:
     return any(hint in value for hint in JOB_TITLE_HINTS)
 
 
-def best_card_match_for_title(job_title: str, job_cards: List[Dict[str, str]], company_domain: str) -> Dict[str, Any]:
-    best: Dict[str, Any] = {}
-    best_score = 0
-    title_norm = normalize_text(job_title)
-
-    for card in job_cards:
-        href = normalize_url(card.get("href", ""))
-        if not href:
-            continue
-        if is_blocked_external_board(href):
-            continue
-        if has_bad_url_fragment(href):
-            continue
-        if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
-            continue
-
-        link_text = str(card.get("link_text") or "")
-        nearby_text = str(card.get("nearby_text") or "")
-        card_title = str(card.get("card_title") or "")
-
-        candidate_texts = [card_title, link_text]
-        candidate_texts.extend(extract_headings_from_text(nearby_text))
-
-        local_best = 0
-        for candidate in candidate_texts:
-            local_best = max(local_best, title_similarity_score(title_norm, candidate))
-
-        if title_norm and title_norm in normalize_text(nearby_text):
-            local_best = max(local_best, 92)
-
-        # Strong penalty for junk/legal links
-        if any(bad in normalize_text(f"{href} {link_text} {nearby_text}") for bad in NON_JOB_LINK_KEYWORDS):
-            local_best = min(local_best, 25)
-
-        if local_best > best_score:
-            best_score = local_best
-            best = {
-                "href": href,
-                "score": local_best,
-                "card_title": card_title,
-                "link_text": link_text,
-                "nearby_text": nearby_text[:1200],
-            }
-
-    return best
-
-
-def patch_missing_seed_urls(job_seeds: List[Dict[str, Any]], job_cards: List[Dict[str, str]], company_domain: str) -> List[Dict[str, Any]]:
-    patched: List[Dict[str, Any]] = []
-
-    for seed in job_seeds:
-        seed_copy = dict(seed)
-        current_url = normalize_url(seed_copy.get("job_url", ""))
-        title = str(seed_copy.get("job_title") or "").strip()
-
-        if current_url:
-            patched.append(seed_copy)
-            continue
-
-        if not title:
-            patched.append(seed_copy)
-            continue
-
-        best = best_card_match_for_title(title, job_cards, company_domain)
-        if best and best.get("href") and int(best.get("score", 0)) >= 70:
-            href = normalize_url(best["href"])
-            if has_bad_url_fragment(href):
-                patched.append(seed_copy)
-                continue
-
-            if is_attachment_url(href):
-                seed_copy["job_url"] = ""
-                reason = str(seed_copy.get("reason") or "").strip()
-                patch_note = "Matching vacancy appears to be attachment-only (PDF/DOC), not a normal HTML job page."
-                seed_copy["reason"] = f"{reason} {patch_note}".strip()
-            else:
-                seed_copy["job_url"] = href
-                reason = str(seed_copy.get("reason") or "").strip()
-                patch_note = f"URL patched from page card match ({best.get('score')})."
-                seed_copy["reason"] = f"{reason} {patch_note}".strip()
-
-        patched.append(seed_copy)
-
-    return patched
-
-
 # =========================================================
 # REFERENCE FILES
 # =========================================================
@@ -690,11 +584,9 @@ def read_company_file(path: Path) -> tuple[Set[str], Set[str]]:
 
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-
         for row in reader:
             domain = normalize_domain(row.get("company_website"))
             name = normalize_text(row.get("company_name"))
-
             if domain:
                 domains.add(domain)
             if name:
@@ -715,12 +607,10 @@ def read_current_jobs_file(path: Path) -> tuple[Set[str], Set[str], Set[str]]:
 
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-
         for row in reader:
             domain = normalize_domain(row.get("company_website"))
             name = normalize_text(row.get("company_name"))
             url = normalize_url(row.get("external_url"))
-
             if domain:
                 domains.add(domain)
             if name:
@@ -741,10 +631,8 @@ def read_irrelevant_keywords(path: Path) -> List[str]:
 
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-
         if "irrelevant_names" not in (reader.fieldnames or []):
             raise ValueError("irrelevant names.csv must have a header named irrelevant_names")
-
         for row in reader:
             keyword = normalize_text(row.get("irrelevant_names"))
             if keyword:
@@ -780,13 +668,10 @@ def read_company_domains() -> List[str]:
         return []
 
     domains = []
-
     with COMPANIES_CSV.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-
         if "company_domain" not in (reader.fieldnames or []):
             raise ValueError("companies.csv must have a header named company_domain")
-
         for row in reader:
             domain = normalize_domain(row.get("company_domain"))
             if domain:
@@ -794,7 +679,6 @@ def read_company_domains() -> List[str]:
 
     unique_domains = []
     seen = set()
-
     for domain in domains:
         if domain in seen:
             continue
@@ -814,10 +698,8 @@ def read_direct_career_pages() -> List[Dict[str, str]]:
         return []
 
     pages = []
-
     with COMPANIES_CAREER_PAGES_CSV.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-
         if "career_page" not in (reader.fieldnames or []):
             raise ValueError("companies_career_pages.csv must have a header named career_page")
 
@@ -825,15 +707,11 @@ def read_direct_career_pages() -> List[Dict[str, str]]:
             career_page = normalize_url(row.get("career_page"))
             if not career_page:
                 continue
-
             if not career_page.startswith("http"):
                 career_page = "https://" + career_page
-
             company_domain = domain_from_url(career_page)
-
             if not company_domain:
                 continue
-
             pages.append({
                 "company_domain": company_domain,
                 "career_page": career_page,
@@ -841,7 +719,6 @@ def read_direct_career_pages() -> List[Dict[str, str]]:
 
     unique_pages = []
     seen = set()
-
     for item in pages:
         key = normalize_url(item["career_page"])
         if key in seen:
@@ -863,13 +740,10 @@ def read_direct_career_pages() -> List[Dict[str, str]]:
 def company_matches(company_domain: str, company_name: str, domains: Set[str], names: Set[str]) -> bool:
     domain = normalize_domain(company_domain)
     name = normalize_text(company_name)
-
     if domain and domain in domains:
         return True
-
     if name and name in names:
         return True
-
     return False
 
 
@@ -877,17 +751,14 @@ def title_has_irrelevant_keyword(title: str, keywords: List[str]) -> bool:
     title_text = normalize_text(title)
     if not title_text:
         return False
-
     return any(keyword in title_text for keyword in keywords)
 
 
 def assign_list_value(company_domain: str, company_name: str, ref: Dict[str, Any]) -> str:
     if company_matches(company_domain, company_name, ref["churned_domains"], ref["churned_names"]):
         return "churned"
-
     if company_matches(company_domain, company_name, ref["active_domains"], ref["active_names"]):
         return "active"
-
     return "inactive"
 
 
@@ -899,16 +770,12 @@ def should_remove_job(row: Dict[str, Any], ref: Dict[str, Any]) -> bool:
 
     if company_matches(company_domain, company_name, ref["blacklist_domains"], ref["blacklist_names"]):
         return True
-
     if company_matches(company_domain, company_name, ref["customers_domains"], ref["customers_names"]):
         return True
-
     if title_has_irrelevant_keyword(title, ref["irrelevant_keywords"]):
         return True
-
     if job_url and job_url in ref["active_urls"]:
         return True
-
     return False
 
 
@@ -919,7 +786,6 @@ def should_remove_job(row: Dict[str, Any], ref: Dict[str, Any]) -> bool:
 def block_unneeded_requests(route):
     request = route.request
     resource_type = request.resource_type
-
     if resource_type in {"image", "font", "media"}:
         route.abort()
     else:
@@ -960,7 +826,7 @@ def rendered_html(page) -> str:
 
 def expand_page(page) -> None:
     try:
-        for amount in (1200, 1800, 2500, 3500):
+        for amount in (1200, 1800, 2500, 3500, 4500):
             page.mouse.wheel(0, amount)
             time.sleep(0.35)
     except Exception:
@@ -982,6 +848,8 @@ def expand_page(page) -> None:
         "Find jobs",
         "Open positions - Vacancies",
         "View Details / Apply",
+        "Load more",
+        "Show more",
     ]
 
     for text in click_texts:
@@ -1016,7 +884,6 @@ def extract_button_navigation_candidates(page, company_domain: str) -> List[str]
 
     urls = []
     seen = set()
-
     url_pattern = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 
     for item in items:
@@ -1034,7 +901,6 @@ def extract_button_navigation_candidates(page, company_domain: str) -> List[str]
             raw_url = str(raw_url or "").strip()
             if not raw_url:
                 continue
-
             if raw_url.startswith("/"):
                 raw_url = urljoin(page.url, raw_url)
 
@@ -1043,7 +909,7 @@ def extract_button_navigation_candidates(page, company_domain: str) -> List[str]
                 continue
             if is_blocked_external_board(raw_url):
                 continue
-            if has_bad_url_fragment(raw_url):
+            if has_exact_bad_url_fragment(raw_url):
                 continue
             if not same_or_subdomain(raw_url, company_domain) and not is_ats_url(raw_url):
                 continue
@@ -1054,7 +920,7 @@ def extract_button_navigation_candidates(page, company_domain: str) -> List[str]
             seen.add(raw_url)
             urls.append(raw_url)
 
-    return urls[:30]
+    return urls[:50]
 
 
 def extract_attachment_candidates(page, company_domain: str) -> List[Dict[str, str]]:
@@ -1096,7 +962,7 @@ def extract_attachment_candidates(page, company_domain: str) -> List[Dict[str, s
             continue
         if is_blocked_external_board(href):
             continue
-        if has_bad_url_fragment(href):
+        if has_exact_bad_url_fragment(href):
             continue
         if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
             continue
@@ -1131,7 +997,7 @@ def extract_attachment_candidates(page, company_domain: str) -> List[Dict[str, s
             "source": "attachment",
         })
 
-    return cards[:40]
+    return cards[:50]
 
 
 def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]]:
@@ -1182,7 +1048,7 @@ def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]
         "details",
     ]
 
-    for item in items[:120]:
+    for item in items[:200]:
         text = normalize_text(item.get("text", ""))
         href = str(item.get("href") or "").strip()
         nearby_text = clean_page_text(item.get("nearby_text", ""), max_chars=2500)
@@ -1191,7 +1057,6 @@ def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]
 
         if not text:
             continue
-
         if not any(normalize_text(t) in text for t in wanted_texts):
             continue
 
@@ -1200,7 +1065,7 @@ def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]
                 href = urljoin(page.url, href)
             href = normalize_url(href)
             if href.startswith("http") and not is_blocked_external_board(href):
-                if not has_bad_url_fragment(href) and (same_or_subdomain(href, company_domain) or is_ats_url(href)):
+                if not has_exact_bad_url_fragment(href) and (same_or_subdomain(href, company_domain) or is_ats_url(href)):
                     key = f"{href}|{card_title}|href"
                     if key not in seen:
                         seen.add(key)
@@ -1243,7 +1108,7 @@ def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]
             new_url = ""
 
         if new_url and new_url.startswith("http") and not is_blocked_external_board(new_url):
-            if not has_bad_url_fragment(new_url) and (same_or_subdomain(new_url, company_domain) or is_ats_url(new_url)):
+            if not has_exact_bad_url_fragment(new_url) and (same_or_subdomain(new_url, company_domain) or is_ats_url(new_url)):
                 key = f"{new_url}|{card_title}|clicked"
                 if key not in seen:
                     seen.add(key)
@@ -1266,7 +1131,7 @@ def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]
         except Exception:
             pass
 
-    return cards[:40]
+    return cards[:80]
 
 
 def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
@@ -1313,7 +1178,7 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
             continue
         if is_blocked_external_board(href):
             continue
-        if has_bad_url_fragment(href):
+        if has_exact_bad_url_fragment(href):
             continue
         if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
             continue
@@ -1368,7 +1233,7 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
         seen.add(key)
         cards.append(card)
 
-    return cards[:260]
+    return cards[:500]
 
 
 def extract_next_page_candidates(page, company_domain: str) -> List[str]:
@@ -1400,7 +1265,7 @@ def extract_next_page_candidates(page, company_domain: str) -> List[str]:
             continue
         if is_blocked_external_board(href):
             continue
-        if has_bad_url_fragment(href):
+        if has_exact_bad_url_fragment(href):
             continue
         if is_attachment_url(href):
             continue
@@ -1408,7 +1273,6 @@ def extract_next_page_candidates(page, company_domain: str) -> List[str]:
             continue
 
         combined_extra = f"{text} {outer_html}"
-
         if not is_likely_next_page(href, text, combined_extra):
             continue
 
@@ -1428,7 +1292,7 @@ def extract_next_page_candidates(page, company_domain: str) -> List[str]:
             seen.add(href)
             candidates.append(href)
 
-    return candidates[:40]
+    return candidates[:80]
 
 
 def find_career_pages_from_domain(context, domain: str) -> List[str]:
@@ -1474,7 +1338,7 @@ def find_career_pages_from_domain(context, domain: str) -> List[str]:
         seen.add(url)
         unique.append(url)
 
-    return unique[:15]
+    return unique[:20]
 
 
 # =========================================================
@@ -1513,7 +1377,6 @@ def find_dates_in_object(obj: Any, source_prefix: str = "structured_data") -> Li
 
 def extract_structured_dates_from_html(html: str) -> List[Dict[str, str]]:
     dates = []
-
     soup = BeautifulSoup(html or "", "html.parser")
 
     for script in soup.find_all("script", type=lambda x: x and "ld+json" in x.lower()):
@@ -1521,12 +1384,10 @@ def extract_structured_dates_from_html(html: str) -> List[Dict[str, str]]:
         raw = raw.strip()
         if not raw:
             continue
-
         try:
             data = json.loads(raw)
         except Exception:
             continue
-
         dates.extend(find_dates_in_object(data, "structured_data"))
 
     meta_names = [
@@ -1546,7 +1407,6 @@ def extract_structured_dates_from_html(html: str) -> List[Dict[str, str]]:
         content = meta.get("content") or ""
         if not name or not content:
             continue
-
         if normalize_text(name) in normalized_meta_names:
             dates.append({
                 "date": str(content),
@@ -1560,7 +1420,6 @@ def first_structured_date(html: str) -> tuple[str, str]:
     dates = extract_structured_dates_from_html(html)
     if not dates:
         return "", ""
-
     return dates[0]["date"], dates[0]["source"]
 
 
@@ -1584,26 +1443,119 @@ def extract_page_level_titles(page_text: str) -> List[str]:
                 seen.add(key)
                 titles.append(value)
 
-    return titles[:20]
+    return titles[:50]
+
+
+def page_looks_like_large_jobs_board(page_text: str, job_cards: List[Dict[str, str]]) -> bool:
+    titles = extract_page_level_titles(page_text)
+    unique_titles = {normalize_text(t) for t in titles if t}
+    if len(unique_titles) >= 6:
+        return True
+
+    html_job_cards = [
+        c for c in job_cards
+        if normalize_url(c.get("href", "")) and not is_attachment_url(normalize_url(c.get("href", "")))
+    ]
+    unique_urls = {normalize_url(c.get("href", "")) for c in html_job_cards if normalize_url(c.get("href", ""))}
+    if len(unique_urls) >= 6:
+        return True
+
+    normalized = normalize_text(page_text)
+    if "showing" in normalized and "jobs" in normalized:
+        return True
+    if "search jobs" in normalized and len(unique_titles) >= 3:
+        return True
+
+    return False
 
 
 def infer_page_level_skip_reason(page_text: str, job_cards: List[Dict[str, str]]) -> str:
     text_norm = normalize_text(page_text)
     attachments = [c for c in job_cards if c.get("source") == "attachment"]
-    empty_or_attachment_cards = [
-        c for c in job_cards
-        if not normalize_url(c.get("href", "")) or is_attachment_url(normalize_url(c.get("href", "")))
-    ]
 
     if attachments:
         return "Vacancy appears to exist on page, but only attachment-based job files (PDF/DOC) were found."
-    if any("apply only" in normalize_text(c.get("nearby_text", "")) for c in job_cards):
-        return "Vacancy signals found, but only apply-only / non-descriptive pages were detected."
     if "current vacancies" in text_norm or "job openings" in text_norm or "open positions" in text_norm:
         return "Career page shows vacancy signals, but no usable job seeds were extracted."
-    if empty_or_attachment_cards:
-        return "Job-like blocks were found, but no normal HTML job detail URLs were extracted."
     return "Career page shows likely open-job signals, but no usable job seeds were extracted."
+
+
+def deterministic_seed_candidates_from_cards(
+    page_url: str,
+    page_text: str,
+    company_domain: str,
+    job_cards: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    seeds: List[Dict[str, Any]] = []
+    seen = set()
+
+    for card in job_cards:
+        href = normalize_url(card.get("href", ""))
+        link_text = str(card.get("link_text") or "").strip()
+        card_title = str(card.get("card_title") or "").strip()
+        nearby_text = str(card.get("nearby_text") or "")
+
+        title = ""
+        if looks_like_job_title(card_title):
+            title = card_title
+        elif looks_like_job_title(link_text):
+            title = link_text
+        else:
+            for heading in extract_headings_from_text(nearby_text):
+                if looks_like_job_title(heading):
+                    title = heading
+                    break
+
+        if not title:
+            continue
+
+        if has_exact_bad_url_fragment(href):
+            continue
+
+        if href and is_attachment_url(href):
+            href = ""
+
+        if href and not (same_or_subdomain(href, company_domain) or is_ats_url(href)):
+            continue
+
+        key = f"{normalize_text(title)}|{href or page_url}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        seeds.append({
+            "company_name": "",
+            "job_title": title,
+            "job_url": href,
+            "job_location": "",
+            "confidence": "medium",
+            "reason": "Deterministic page-card extraction.",
+            "__page_url": page_url,
+            "__page_text": page_text,
+        })
+
+    return seeds
+
+
+def merge_and_dedupe_seeds(
+    gemini_seeds: List[Dict[str, Any]],
+    deterministic_seeds: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+
+    for seed in gemini_seeds + deterministic_seeds:
+        title = normalize_text(seed.get("job_title", ""))
+        url = normalize_url(seed.get("job_url", "")) or ""
+        key = f"{title}|{url}"
+        if not title:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(seed)
+
+    return merged
 
 
 # =========================================================
@@ -1611,10 +1563,10 @@ def infer_page_level_skip_reason(page_text: str, job_cards: List[Dict[str, str]]
 # =========================================================
 
 def build_career_page_prompt(company_domain: str, career_page_url: str, page_text: str, job_cards: List[Dict[str, str]]) -> str:
-    cards_text = json.dumps(job_cards[:220], ensure_ascii=False, indent=2)
+    cards_text = json.dumps(job_cards[:250], ensure_ascii=False, indent=2)
 
     return f"""
-You are extracting currently open job vacancies from a rendered company career page.
+You are extracting all currently open jobs visible on a company career page.
 
 Company domain: {company_domain}
 Career page URL: {career_page_url}
@@ -1624,22 +1576,19 @@ Rules:
 - No markdown.
 - Output must be an object with key "jobs".
 - "jobs" must be a list.
-- Extract ALL currently open jobs visible in the provided rendered career page content.
-- Do not filter by category.
+- Extract ALL visible open jobs from the page.
+- Do not decide whether the career page is "good" or "bad".
+- Do not judge whether the website format is ideal.
+- Your only task is to identify visible jobs and return them.
+- Use JOB_CARDS first whenever possible.
+- If a visible job has a normal HTML detail URL, return it.
+- If a visible job only has the same-page career URL and the job appears directly on the page, return job_url = "".
+- If a visible job only has a PDF/DOC attachment, return job_url = "" and mention that in reason.
+- A job is valid even if the page also contains an Apply button or application form, as long as the page also contains real job description content.
 - Do not invent jobs.
-- Do not include closed, expired, unavailable, speculative, or generic talent pool roles unless clearly listed as open.
-- If there are no currently open jobs, return {{"jobs":[]}}.
-- Prefer the most specific normal HTML job URL from JOB_CARDS when available.
-- JOB_CARDS may contain the exact job detail page URL even when the main page only shows a generic button like "View Details / Apply".
-- If a job title in the page text matches a JOB_CARD nearby_text/card_title, use that JOB_CARD href as job_url.
-- If a visible job exists but only a PDF/DOC attachment is available, still return the job with job_url = "" and mention attachment-only in reason.
-- If a visible job exists directly on the career page and there is no separate normal job URL, still return the job with job_url = "" and explain that the job is only on the career page / no separate detail URL.
-- A job is still valid even if the page contains an Apply button or application form, as long as a real job description is also present.
-- Do not use unrelated external job-board URLs.
-- Do not use the career page URL as job_url unless the role clearly exists on that same page and no separate detail URL is available.
-- If the exact job detail URL is not available, use an empty string.
+- Do not use privacy / cookie / legal / policy links as job URLs.
 - confidence should be "high", "medium", or "low".
-- reason should be short and explain why the role was extracted or why no normal URL exists.
+- reason should be short.
 
 Return this JSON shape:
 {{
@@ -1682,23 +1631,21 @@ Structured posted date source: {structured_posted_date_source}
 Rules:
 - Return ONLY valid JSON.
 - No markdown.
-- Do not invent information.
 - Extract only what is explicitly present in the job page text or structured posted date fields.
-- If the page says page not found, job not found, vacancy unavailable, expired, closed, or does not contain a real job description, return:
+- If the page says page not found, job not found, vacancy unavailable, expired, or clearly lacks a real job description, return:
   {{"is_valid_open_job": false}}
-- A page with an Apply button/form can still be a valid job page if it also contains a real job description.
+- A page with an Apply button/form can still be valid if it also has real job description content.
 - Otherwise return:
   {{"is_valid_open_job": true, ...fields...}}
 - job_posted_date:
-  - Use the structured posted date if provided.
-  - Otherwise only extract a visible posted/published date if explicitly shown in the job page text.
-  - If no posted date is available, return empty string.
+  - Use structured posted date if available.
+  - Otherwise only use a clearly visible posted/published date.
+  - Else return empty string.
 - job_posted_date_source:
-  - If using structured posted date, return the provided structured source.
-  - If using visible text, return "visible_text".
-  - If no date exists, return empty string.
+  - structured source if used
+  - "visible_text" if visible text used
+  - else empty string
 - Do NOT summarize job_description.
-- The script will save the full job description itself, so you do not need to return job_description.
 - confidence should be "high", "medium", or "low".
 - reason should be short.
 
@@ -1732,12 +1679,14 @@ def parse_gemini_json(text: str) -> Dict[str, Any]:
     except Exception:
         match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
         if not match:
-            raise
-        data = json.loads(match.group(0))
+            return {}
+        try:
+            data = json.loads(match.group(0))
+        except Exception:
+            return {}
 
     if not isinstance(data, dict):
         return {}
-
     return data
 
 
@@ -1750,20 +1699,25 @@ def extract_jobs_from_career_page_with_gemini(
 ) -> List[Dict[str, Any]]:
     prompt = build_career_page_prompt(company_domain, career_page_url, page_text, job_cards)
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-    )
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+    except Exception as exc:
+        print(f"[WARN] Gemini career-page extraction failed for {career_page_url}: {exc}")
+        return []
 
-    data = parse_gemini_json(response.text or "")
+    data = parse_gemini_json(getattr(response, "text", "") or "")
     jobs = data.get("jobs", [])
-
     if not isinstance(jobs, list):
         return []
 
-    jobs = [job for job in jobs if isinstance(job, dict)]
-    jobs = patch_missing_seed_urls(jobs, job_cards, company_domain)
-    return jobs
+    output = []
+    for job in jobs:
+        if isinstance(job, dict):
+            output.append(job)
+    return output
 
 
 def enrich_job_page_with_gemini(
@@ -1782,16 +1736,18 @@ def enrich_job_page_with_gemini(
         structured_posted_date_source=structured_posted_date_source,
     )
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-    )
-
-    data = parse_gemini_json(response.text or "")
-
-    if not isinstance(data, dict):
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+    except Exception as exc:
+        print(f"[WARN] Gemini job-page enrichment failed for {job_url}: {exc}")
         return {}
 
+    data = parse_gemini_json(getattr(response, "text", "") or "")
+    if not isinstance(data, dict):
+        return {}
     return data
 
 
@@ -1799,9 +1755,8 @@ def enrich_job_page_with_gemini(
 # JOB PAGE PROCESSING
 # =========================================================
 
-def try_build_same_page_job(job_seed: Dict[str, Any]) -> Dict[str, Any]:
+def try_build_same_page_job(job_seed: Dict[str, Any], page_text: str, job_cards: List[Dict[str, str]]) -> Dict[str, Any]:
     page_url = normalize_url(job_seed.get("__page_url", ""))
-    page_text = str(job_seed.get("__page_text") or "")
     title = str(job_seed.get("job_title") or "").strip()
     company_name = str(job_seed.get("company_name") or "").strip()
     location = str(job_seed.get("job_location") or "").strip()
@@ -1813,15 +1768,21 @@ def try_build_same_page_job(job_seed: Dict[str, Any]) -> Dict[str, Any]:
             "invalid_reason": "Visible vacancy found, but no specific normal job URL was available.",
         }
 
-    # same-page is only acceptable when the page really contains a proper description
+    if page_looks_like_large_jobs_board(page_text, job_cards):
+        return {
+            "is_valid_open_job": False,
+            "invalid_reason": "Page is a large jobs board; same-page fallback was not allowed.",
+            "job_url": page_url,
+        }
+
     if title and normalize_text(title) not in normalize_text(page_text):
         return {
             "is_valid_open_job": False,
             "invalid_reason": "Visible vacancy found, but the job title could not be confidently matched on the same page.",
+            "job_url": page_url,
         }
 
     cleaned_description = clean_job_description(page_text)
-
     if not has_real_job_description(cleaned_description):
         return {
             "is_valid_open_job": False,
@@ -1845,7 +1806,14 @@ def try_build_same_page_job(job_seed: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def open_job_page_and_extract(context, client: genai.Client, company_domain: str, job_seed: Dict[str, Any]) -> Dict[str, Any]:
+def open_job_page_and_extract(
+    context,
+    client: genai.Client,
+    company_domain: str,
+    job_seed: Dict[str, Any],
+    page_text_for_same_page: str,
+    job_cards_for_same_page: List[Dict[str, str]],
+) -> Dict[str, Any]:
     seed_url = normalize_url(job_seed.get("job_url"))
 
     if not seed_url:
@@ -1855,7 +1823,7 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
                 "is_valid_open_job": False,
                 "invalid_reason": "Visible vacancy found, but only PDF/DOC attachment exists and no normal HTML job page is available.",
             }
-        return try_build_same_page_job(job_seed)
+        return try_build_same_page_job(job_seed, page_text_for_same_page, job_cards_for_same_page)
 
     if is_attachment_url(seed_url):
         return {
@@ -1884,8 +1852,7 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
     cleaned_description = clean_job_description(page_text)
 
     if not has_real_job_description(cleaned_description):
-        # fallback: some jobs actually live on the career page itself
-        same_page_result = try_build_same_page_job(job_seed)
+        same_page_result = try_build_same_page_job(job_seed, page_text_for_same_page, job_cards_for_same_page)
         if same_page_result.get("is_valid_open_job"):
             return same_page_result
 
@@ -1904,22 +1871,17 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
             "job_page_text_sample": page_text[:1000],
         }
 
-    try:
-        enriched = enrich_job_page_with_gemini(
-            client=client,
-            company_domain=company_domain,
-            job_url=final_url or seed_url,
-            job_page_text=cleaned_description,
-            structured_posted_date=structured_date,
-            structured_posted_date_source=structured_source,
-        )
-    except Exception as exc:
-        print(f"[WARN] Gemini job-page enrichment failed for {seed_url}: {exc}")
-        enriched = {}
+    enriched = enrich_job_page_with_gemini(
+        client=client,
+        company_domain=company_domain,
+        job_url=final_url or seed_url,
+        job_page_text=cleaned_description,
+        structured_posted_date=structured_date,
+        structured_posted_date_source=structured_source,
+    )
 
     if enriched.get("is_valid_open_job") is False:
-        # do not lose valid same-page jobs
-        same_page_result = try_build_same_page_job(job_seed)
+        same_page_result = try_build_same_page_job(job_seed, page_text_for_same_page, job_cards_for_same_page)
         if same_page_result.get("is_valid_open_job"):
             return same_page_result
 
@@ -1980,7 +1942,7 @@ def add_page_level_skipped_jobs(
     checked_at: str,
 ) -> None:
     if titles:
-        for title in titles[:12]:
+        for title in titles[:20]:
             skipped_jobs.append({
                 "company_domain": company_domain,
                 "career_page_url": career_page_url,
@@ -2035,7 +1997,8 @@ def process_single_rendered_page(
     page_text = ""
     job_cards: List[Dict[str, str]] = []
     next_pages: List[str] = []
-    job_seeds: List[Dict[str, Any]] = []
+    gemini_seeds: List[Dict[str, Any]] = []
+    deterministic_seeds: List[Dict[str, Any]] = []
 
     try:
         ok = safe_goto(page, page_url)
@@ -2046,17 +2009,17 @@ def process_single_rendered_page(
         expand_page(page)
         if force_deeper:
             expand_page(page)
-            time.sleep(0.8)
+            time.sleep(1.0)
 
         page_text = rendered_page_text(page, max_chars=90000)
         job_cards = extract_nearby_job_cards(page, company_domain)
         next_pages = extract_next_page_candidates(page, company_domain)
 
         raw["career_page_text_sample"] = page_text[:5000]
-        raw["job_cards_sample"] = job_cards[:60]
-        raw["next_pages"] = next_pages[:20]
+        raw["job_cards_sample"] = job_cards[:80]
+        raw["next_pages"] = next_pages[:30]
 
-        job_seeds = extract_jobs_from_career_page_with_gemini(
+        gemini_seeds = extract_jobs_from_career_page_with_gemini(
             client=client,
             company_domain=company_domain,
             career_page_url=page_url,
@@ -2064,14 +2027,20 @@ def process_single_rendered_page(
             job_cards=job_cards,
         )
 
+        deterministic_seeds = deterministic_seed_candidates_from_cards(
+            page_url=page_url,
+            page_text=page_text,
+            company_domain=company_domain,
+            job_cards=job_cards,
+        )
+
+        job_seeds = merge_and_dedupe_seeds(gemini_seeds, deterministic_seeds)
+
         job_seeds = [
             seed for seed in job_seeds
             if not is_blocked_external_board(str(seed.get("job_url") or ""))
         ]
 
-        job_seeds = patch_missing_seed_urls(job_seeds, job_cards, company_domain)
-
-        # attach same-page fallback context to each seed
         for seed in job_seeds:
             seed["__page_url"] = page_url
             seed["__page_text"] = page_text
@@ -2085,11 +2054,9 @@ def process_single_rendered_page(
     finally:
         page.close()
 
-    # page-level skip logging when there are strong signals but zero usable seeds
-    if not job_seeds:
+    if not raw["job_seeds"]:
         page_titles = extract_page_level_titles(page_text)
         attachments = [c for c in job_cards if c.get("source") == "attachment"]
-
         strong_signal = bool(page_titles) or bool(attachments) or has_zero_job_retry_signal(page_text)
 
         if strong_signal:
@@ -2108,13 +2075,20 @@ def process_single_rendered_page(
                 "reason": reason,
                 "job_url": "",
                 "job_page_text_sample": page_text[:1000],
-                "page_level_titles": page_titles[:12],
+                "page_level_titles": page_titles[:20],
             })
 
-    job_seeds = job_seeds[:MAX_JOB_LINKS_PER_COMPANY]
+    job_seeds = raw["job_seeds"][:MAX_JOB_LINKS_PER_COMPANY]
 
     for seed in job_seeds:
-        job_data = open_job_page_and_extract(context, client, company_domain, seed)
+        job_data = open_job_page_and_extract(
+            context=context,
+            client=client,
+            company_domain=company_domain,
+            job_seed=seed,
+            page_text_for_same_page=page_text,
+            job_cards_for_same_page=job_cards,
+        )
 
         if not job_data.get("is_valid_open_job"):
             reason = job_data.get("invalid_reason", "Invalid or closed job page.")
@@ -2185,13 +2159,7 @@ def process_single_rendered_page(
 
         if is_blocked_external_board(job_url):
             reason = "Removed because URL belongs to blocked external job board."
-
-            raw["skipped_jobs"].append({
-                "seed": seed,
-                "reason": reason,
-                "job_url": job_url,
-            })
-
+            raw["skipped_jobs"].append({"seed": seed, "reason": reason, "job_url": job_url})
             add_skipped_job(
                 skipped_jobs=skipped_jobs_debug,
                 company_domain=company_domain,
@@ -2203,15 +2171,9 @@ def process_single_rendered_page(
             )
             continue
 
-        if has_bad_url_fragment(job_url):
-            reason = "Removed because resolved URL was a non-job policy/legal/about page."
-
-            raw["skipped_jobs"].append({
-                "seed": seed,
-                "reason": reason,
-                "job_url": job_url,
-            })
-
+        if has_exact_bad_url_fragment(job_url):
+            reason = "Removed because resolved URL was a non-job policy/legal page."
+            raw["skipped_jobs"].append({"seed": seed, "reason": reason, "job_url": job_url})
             add_skipped_job(
                 skipped_jobs=skipped_jobs_debug,
                 company_domain=company_domain,
@@ -2243,13 +2205,7 @@ def process_single_rendered_page(
 
         if not has_real_job_description(row["job_description"]):
             reason = "Final row removed because job_description is missing/too short/invalid."
-
-            raw["skipped_jobs"].append({
-                "seed": seed,
-                "reason": reason,
-                "job_url": job_url,
-            })
-
+            raw["skipped_jobs"].append({"seed": seed, "reason": reason, "job_url": job_url})
             add_skipped_job(
                 skipped_jobs=skipped_jobs_debug,
                 company_domain=company_domain,
@@ -2264,13 +2220,7 @@ def process_single_rendered_page(
 
         if should_remove_job(row, ref):
             reason = "Removed by blacklist/customers/current jobs/irrelevant names logic."
-
-            raw["skipped_jobs"].append({
-                "seed": seed,
-                "reason": reason,
-                "job_url": job_url,
-            })
-
+            raw["skipped_jobs"].append({"seed": seed, "reason": reason, "job_url": job_url})
             add_skipped_job(
                 skipped_jobs=skipped_jobs_debug,
                 company_domain=company_domain,
@@ -2284,7 +2234,6 @@ def process_single_rendered_page(
             continue
 
         row["List"] = assign_list_value(company_domain, company_name, ref)
-
         rows.append(row)
         raw["jobs"].append(row)
 
@@ -2334,12 +2283,13 @@ def process_career_page(
         all_rows.extend(rows)
 
         if rows:
-            break
+            # keep exploring next pages too, because a career site may split jobs across pages
+            pass
 
         current_text_sample = raw.get("career_page_text_sample", "")
         should_retry_deeper = has_zero_job_retry_signal(current_text_sample) or len(next_pages) > 0
 
-        if should_retry_deeper:
+        if should_retry_deeper and not rows:
             retry_rows, retry_raw, retry_next_pages = process_single_rendered_page(
                 context=context,
                 client=client,
@@ -2355,9 +2305,6 @@ def process_career_page(
             retry_raw["retry_reason"] = "Zero jobs found on first pass; stronger retry executed."
             raw_items.append(retry_raw)
             all_rows.extend(retry_rows)
-
-            if retry_rows:
-                break
 
             for next_page in retry_next_pages:
                 next_page = normalize_url(next_page)
@@ -2387,7 +2334,7 @@ def process_domain_discovery(
     all_rows = []
     raw_items = []
 
-    for career_url in career_urls[:5]:
+    for career_url in career_urls[:8]:
         rows, raws = process_career_page(
             context=context,
             client=client,
@@ -2400,10 +2347,6 @@ def process_domain_discovery(
 
         all_rows.extend(rows)
         raw_items.extend(raws)
-
-        if all_rows:
-            break
-
         time.sleep(SLEEP_SECONDS)
 
     return all_rows, raw_items
@@ -2419,10 +2362,8 @@ def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     for row in rows:
         key = normalize_url(row.get("job_url")) or f"{normalize_domain(row.get('company_domain'))}|{normalize_text(row.get('job_title'))}"
-
         if key in seen:
             continue
-
         seen.add(key)
         output.append(row)
 
@@ -2498,7 +2439,6 @@ def main() -> None:
 
                 all_rows.extend(rows)
                 raw_results.extend(raws)
-
                 time.sleep(SLEEP_SECONDS)
 
         else:
@@ -2522,7 +2462,6 @@ def main() -> None:
 
                 all_rows.extend(rows)
                 raw_results.extend(raw_items)
-
                 time.sleep(SLEEP_SECONDS)
 
         context.close()

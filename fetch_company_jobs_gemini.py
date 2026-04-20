@@ -214,7 +214,6 @@ JOB_TITLE_HINTS = [
     "data",
     "scientist",
     "recruiter",
-    "officer",
     "buyer",
     "electrician",
     "mechanic",
@@ -433,6 +432,24 @@ def has_real_job_description(text: str) -> bool:
     if is_apply_only_page(cleaned):
         return False
     return description_signal_count(cleaned) >= 2
+
+
+def has_zero_job_retry_signal(text: str) -> bool:
+    normalized = normalize_text(text)
+    signals = [
+        "vacancies",
+        "open positions",
+        "search jobs",
+        "view jobs",
+        "loading",
+        "apply now",
+        "open roles",
+        "job openings",
+        "join our team",
+        "current vacancies",
+        "learn more",
+    ]
+    return any(signal in normalized for signal in signals)
 
 
 # =========================================================
@@ -906,7 +923,6 @@ def deterministic_seed_candidates_from_cards(
 
     for card in cards:
         href = normalize_url(card.get("href", ""))
-        link_text = str(card.get("link_text") or "").strip()
         nearby_text = str(card.get("nearby_text") or "")
         title = best_title_from_card(card)
 
@@ -1250,7 +1266,7 @@ def page_looks_like_large_jobs_board(page_text: str, seeds: List[Dict[str, Any]]
     return False
 
 
-def try_build_same_page_job(job_seed: Dict[str, Any], page_text: str, all_page_seeds: List[Dict[str, Any]]) -> Dict[str, Any]:
+def try_build_same_page_job(job_seed: Dict[str, Any], page_text: str, seeds: List[Dict[str, Any]]) -> Dict[str, Any]:
     page_url = normalize_url(job_seed.get("__page_url", ""))
     title = str(job_seed.get("job_title") or "").strip()
     company_name = str(job_seed.get("company_name") or "").strip()
@@ -1263,7 +1279,7 @@ def try_build_same_page_job(job_seed: Dict[str, Any], page_text: str, all_page_s
             "invalid_reason": "Visible vacancy found, but no specific normal job URL was available.",
         }
 
-    if page_looks_like_large_jobs_board(page_text, all_page_seeds):
+    if page_looks_like_large_jobs_board(page_text, seeds):
         return {
             "is_valid_open_job": False,
             "invalid_reason": "Page is a large jobs board; same-page fallback was not allowed.",
@@ -1307,7 +1323,7 @@ def open_job_page_and_extract(
     company_domain: str,
     job_seed: Dict[str, Any],
     page_text_for_same_page: str,
-    all_page_seeds: List[Dict[str, Any]],
+    seeds: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     seed_url = normalize_url(job_seed.get("job_url"))
 
@@ -1318,7 +1334,7 @@ def open_job_page_and_extract(
                 "is_valid_open_job": False,
                 "invalid_reason": "Visible vacancy found, but only PDF/DOC attachment exists and no normal HTML job page is available.",
             }
-        return try_build_same_page_job(job_seed, page_text_for_same_page, all_page_seeds)
+        return try_build_same_page_job(job_seed, page_text_for_same_page, seeds)
 
     if is_attachment_url(seed_url):
         return {
@@ -1362,7 +1378,7 @@ def open_job_page_and_extract(
     cleaned_description = clean_job_description(page_text)
 
     if not has_real_job_description(cleaned_description):
-        same_page_result = try_build_same_page_job(job_seed, page_text_for_same_page, all_page_seeds)
+        same_page_result = try_build_same_page_job(job_seed, page_text_for_same_page, seeds)
         if same_page_result.get("is_valid_open_job"):
             return same_page_result
 
@@ -1391,7 +1407,7 @@ def open_job_page_and_extract(
     )
 
     if enriched.get("is_valid_open_job") is False:
-        same_page_result = try_build_same_page_job(job_seed, page_text_for_same_page, all_page_seeds)
+        same_page_result = try_build_same_page_job(job_seed, page_text_for_same_page, seeds)
         if same_page_result.get("is_valid_open_job"):
             return same_page_result
 
@@ -1537,7 +1553,7 @@ def process_single_rendered_page(
             company_domain=company_domain,
             job_seed=seed,
             page_text_for_same_page=page_text,
-            all_page_seeds=job_seeds,
+            seeds=job_seeds,
         )
 
         if not job_data.get("is_valid_open_job"):

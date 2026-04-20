@@ -203,6 +203,7 @@ BLOCKED_EXTERNAL_JOB_BOARDS = [
 NON_JOB_LINK_KEYWORDS = [
     "privacy",
     "cookie",
+    "cookies",
     "terms",
     "contact",
     "about",
@@ -217,6 +218,13 @@ NON_JOB_LINK_KEYWORDS = [
     "instagram",
     "twitter",
     "youtube",
+    "policy",
+    "policies",
+    "legal",
+    "accessibility",
+    "modern slavery",
+    "gender pay",
+    "sitemap",
 ]
 
 CLOSED_OR_INVALID_JOB_SIGNALS = [
@@ -363,6 +371,40 @@ def is_closed_or_invalid_page(text: str) -> bool:
     return any(signal in normalized for signal in CLOSED_OR_INVALID_JOB_SIGNALS)
 
 
+def description_signal_count(text: str) -> int:
+    normalized = normalize_text(text)
+    signals = [
+        "responsibilities",
+        "requirements",
+        "the role",
+        "about the role",
+        "job description",
+        "what you will do",
+        "what you'll do",
+        "essential criteria",
+        "key responsibilities",
+        "skills",
+        "experience",
+        "about you",
+        "qualifications",
+        "benefits",
+        "role overview",
+        "summary",
+        "person specification",
+        "what we are looking for",
+        "what we're looking for",
+        "duties",
+        "salary",
+        "location",
+        "full time",
+        "part time",
+        "permanent",
+        "hybrid",
+        "remote",
+    ]
+    return sum(1 for signal in signals if signal in normalized)
+
+
 def is_apply_only_page(text: str) -> bool:
     normalized = normalize_text(text)
 
@@ -379,30 +421,22 @@ def is_apply_only_page(text: str) -> bool:
         "first name",
         "last name",
         "email address",
+        "phone number",
+        "upload cv",
+        "upload resume",
         "powered by",
         "report this job",
     ]
 
     matched = sum(1 for signal in strong_apply_form_signals if signal in normalized)
+    desc_count = description_signal_count(normalized)
 
-    real_description_signals = [
-        "about the role",
-        "the role",
-        "responsibilities",
-        "requirements",
-        "about you",
-        "what you will do",
-        "what you'll do",
-        "key responsibilities",
-        "skills and experience",
-        "experience required",
-        "qualifications",
-        "benefits",
-    ]
+    # Only treat as apply-only when form signals are strong
+    # AND description content is weak.
+    if matched >= 5 and desc_count <= 1:
+        return True
 
-    has_real_content = any(signal in normalized for signal in real_description_signals)
-
-    if matched >= 4 and not has_real_content:
+    if matched >= 7 and desc_count <= 2:
         return True
 
     return False
@@ -419,25 +453,7 @@ def has_real_job_description(text: str) -> bool:
     if is_apply_only_page(cleaned):
         return False
 
-    role_signals = [
-        "responsibilities",
-        "requirements",
-        "the role",
-        "about the role",
-        "job description",
-        "what you will do",
-        "what you'll do",
-        "essential criteria",
-        "key responsibilities",
-        "skills",
-        "experience",
-        "about you",
-        "qualifications",
-        "benefits",
-    ]
-
-    normalized = normalize_text(cleaned)
-    return any(signal in normalized for signal in role_signals)
+    return description_signal_count(cleaned) >= 2
 
 
 def is_ats_url(url: str) -> bool:
@@ -458,12 +474,38 @@ def is_attachment_url(url: str) -> bool:
     return any(url_norm.endswith(ext) or f"{ext}?" in url_norm for ext in ATTACHMENT_EXTENSIONS)
 
 
+def has_bad_url_fragment(url: str) -> bool:
+    url_norm = normalize_text(url)
+    bad_fragments = [
+        "/privacy",
+        "/cookie",
+        "/cookies",
+        "/terms",
+        "/contact",
+        "/about",
+        "/policy",
+        "/policies",
+        "/legal",
+        "/accessibility",
+        "/sitemap",
+        "/modern-slavery",
+        "/gender-pay",
+    ]
+    return any(fragment in url_norm for fragment in bad_fragments)
+
+
 def is_likely_job_url(url: str, text: str = "", nearby_text: str = "") -> bool:
     combined = normalize_text(f"{url} {text} {nearby_text}")
     if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
         return False
 
+    if has_bad_url_fragment(url):
+        return False
+
     if is_blocked_external_board(url):
+        return False
+
+    if is_attachment_url(url):
         return False
 
     if any(pattern in combined for pattern in JOB_URL_PATTERNS):
@@ -479,6 +521,9 @@ def is_likely_next_page(url: str, text: str = "", nearby_text: str = "") -> bool
     combined = normalize_text(f"{url} {text} {nearby_text}")
 
     if any(bad in combined for bad in NON_JOB_LINK_KEYWORDS):
+        return False
+
+    if has_bad_url_fragment(url):
         return False
 
     if is_blocked_external_board(url):
@@ -556,6 +601,8 @@ def best_card_match_for_title(job_title: str, job_cards: List[Dict[str, str]], c
             continue
         if is_blocked_external_board(href):
             continue
+        if has_bad_url_fragment(href):
+            continue
         if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
             continue
 
@@ -572,6 +619,10 @@ def best_card_match_for_title(job_title: str, job_cards: List[Dict[str, str]], c
 
         if title_norm and title_norm in normalize_text(nearby_text):
             local_best = max(local_best, 92)
+
+        # Strong penalty for junk/legal links
+        if any(bad in normalize_text(f"{href} {link_text} {nearby_text}") for bad in NON_JOB_LINK_KEYWORDS):
+            local_best = min(local_best, 25)
 
         if local_best > best_score:
             best_score = local_best
@@ -603,8 +654,12 @@ def patch_missing_seed_urls(job_seeds: List[Dict[str, Any]], job_cards: List[Dic
             continue
 
         best = best_card_match_for_title(title, job_cards, company_domain)
-        if best and best.get("href") and int(best.get("score", 0)) >= 60:
+        if best and best.get("href") and int(best.get("score", 0)) >= 70:
             href = normalize_url(best["href"])
+            if has_bad_url_fragment(href):
+                patched.append(seed_copy)
+                continue
+
             if is_attachment_url(href):
                 seed_copy["job_url"] = ""
                 reason = str(seed_copy.get("reason") or "").strip()
@@ -988,6 +1043,8 @@ def extract_button_navigation_candidates(page, company_domain: str) -> List[str]
                 continue
             if is_blocked_external_board(raw_url):
                 continue
+            if has_bad_url_fragment(raw_url):
+                continue
             if not same_or_subdomain(raw_url, company_domain) and not is_ats_url(raw_url):
                 continue
             if not is_likely_next_page(raw_url, text, onclick):
@@ -1038,6 +1095,8 @@ def extract_attachment_candidates(page, company_domain: str) -> List[Dict[str, s
         if not href:
             continue
         if is_blocked_external_board(href):
+            continue
+        if has_bad_url_fragment(href):
             continue
         if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
             continue
@@ -1141,7 +1200,7 @@ def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]
                 href = urljoin(page.url, href)
             href = normalize_url(href)
             if href.startswith("http") and not is_blocked_external_board(href):
-                if same_or_subdomain(href, company_domain) or is_ats_url(href):
+                if not has_bad_url_fragment(href) and (same_or_subdomain(href, company_domain) or is_ats_url(href)):
                     key = f"{href}|{card_title}|href"
                     if key not in seen:
                         seen.add(key)
@@ -1184,7 +1243,7 @@ def extract_clickthrough_cards(page, company_domain: str) -> List[Dict[str, str]
             new_url = ""
 
         if new_url and new_url.startswith("http") and not is_blocked_external_board(new_url):
-            if same_or_subdomain(new_url, company_domain) or is_ats_url(new_url):
+            if not has_bad_url_fragment(new_url) and (same_or_subdomain(new_url, company_domain) or is_ats_url(new_url)):
                 key = f"{new_url}|{card_title}|clicked"
                 if key not in seen:
                     seen.add(key)
@@ -1253,6 +1312,8 @@ def extract_nearby_job_cards(page, company_domain: str) -> List[Dict[str, str]]:
         if not href or not nearby_text:
             continue
         if is_blocked_external_board(href):
+            continue
+        if has_bad_url_fragment(href):
             continue
         if not same_or_subdomain(href, company_domain) and not is_ats_url(href):
             continue
@@ -1338,6 +1399,8 @@ def extract_next_page_candidates(page, company_domain: str) -> List[str]:
         if not href or not href.startswith("http"):
             continue
         if is_blocked_external_board(href):
+            continue
+        if has_bad_url_fragment(href):
             continue
         if is_attachment_url(href):
             continue
@@ -1571,8 +1634,9 @@ Rules:
 - If a job title in the page text matches a JOB_CARD nearby_text/card_title, use that JOB_CARD href as job_url.
 - If a visible job exists but only a PDF/DOC attachment is available, still return the job with job_url = "" and mention attachment-only in reason.
 - If a visible job exists directly on the career page and there is no separate normal job URL, still return the job with job_url = "" and explain that the job is only on the career page / no separate detail URL.
+- A job is still valid even if the page contains an Apply button or application form, as long as a real job description is also present.
 - Do not use unrelated external job-board URLs.
-- Do not use the career page URL as job_url if a more specific vacancy/job URL is not available.
+- Do not use the career page URL as job_url unless the role clearly exists on that same page and no separate detail URL is available.
 - If the exact job detail URL is not available, use an empty string.
 - confidence should be "high", "medium", or "low".
 - reason should be short and explain why the role was extracted or why no normal URL exists.
@@ -1620,8 +1684,9 @@ Rules:
 - No markdown.
 - Do not invent information.
 - Extract only what is explicitly present in the job page text or structured posted date fields.
-- If the page says page not found, job not found, vacancy unavailable, expired, closed, apply-only, or does not contain a real job description, return:
+- If the page says page not found, job not found, vacancy unavailable, expired, closed, or does not contain a real job description, return:
   {{"is_valid_open_job": false}}
+- A page with an Apply button/form can still be a valid job page if it also contains a real job description.
 - Otherwise return:
   {{"is_valid_open_job": true, ...fields...}}
 - job_posted_date:
@@ -1734,6 +1799,52 @@ def enrich_job_page_with_gemini(
 # JOB PAGE PROCESSING
 # =========================================================
 
+def try_build_same_page_job(job_seed: Dict[str, Any]) -> Dict[str, Any]:
+    page_url = normalize_url(job_seed.get("__page_url", ""))
+    page_text = str(job_seed.get("__page_text") or "")
+    title = str(job_seed.get("job_title") or "").strip()
+    company_name = str(job_seed.get("company_name") or "").strip()
+    location = str(job_seed.get("job_location") or "").strip()
+    reason = str(job_seed.get("reason") or "").strip()
+
+    if not page_url or not page_text or not title:
+        return {
+            "is_valid_open_job": False,
+            "invalid_reason": "Visible vacancy found, but no specific normal job URL was available.",
+        }
+
+    # same-page is only acceptable when the page really contains a proper description
+    if title and normalize_text(title) not in normalize_text(page_text):
+        return {
+            "is_valid_open_job": False,
+            "invalid_reason": "Visible vacancy found, but the job title could not be confidently matched on the same page.",
+        }
+
+    cleaned_description = clean_job_description(page_text)
+
+    if not has_real_job_description(cleaned_description):
+        return {
+            "is_valid_open_job": False,
+            "invalid_reason": "Visible vacancy found, but the same page does not contain a real job description.",
+            "job_url": page_url,
+            "job_page_text_sample": cleaned_description[:1000],
+        }
+
+    return {
+        "is_valid_open_job": True,
+        "company_name": company_name,
+        "job_title": title,
+        "job_url": page_url,
+        "job_location": location,
+        "job_description": cleaned_description,
+        "job_description_length": len(cleaned_description),
+        "job_posted_date": "",
+        "job_posted_date_source": "",
+        "confidence": str(job_seed.get("confidence") or "medium").strip(),
+        "reason": reason or "Job appears directly on the career page and was kept using the same-page URL.",
+    }
+
+
 def open_job_page_and_extract(context, client: genai.Client, company_domain: str, job_seed: Dict[str, Any]) -> Dict[str, Any]:
     seed_url = normalize_url(job_seed.get("job_url"))
 
@@ -1744,10 +1855,7 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
                 "is_valid_open_job": False,
                 "invalid_reason": "Visible vacancy found, but only PDF/DOC attachment exists and no normal HTML job page is available.",
             }
-        return {
-            "is_valid_open_job": False,
-            "invalid_reason": "Visible vacancy found, but no specific normal job URL was available.",
-        }
+        return try_build_same_page_job(job_seed)
 
     if is_attachment_url(seed_url):
         return {
@@ -1775,15 +1883,20 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
     structured_date, structured_source = first_structured_date(html)
     cleaned_description = clean_job_description(page_text)
 
-    if is_apply_only_page(cleaned_description):
-        return {
-            "is_valid_open_job": False,
-            "invalid_reason": "Job page is only an apply form and does not contain a real job description.",
-            "job_url": final_url or seed_url,
-            "job_page_text_sample": page_text[:1000],
-        }
-
     if not has_real_job_description(cleaned_description):
+        # fallback: some jobs actually live on the career page itself
+        same_page_result = try_build_same_page_job(job_seed)
+        if same_page_result.get("is_valid_open_job"):
+            return same_page_result
+
+        if is_apply_only_page(cleaned_description):
+            return {
+                "is_valid_open_job": False,
+                "invalid_reason": "Job page appears to be mostly an apply form and does not contain enough real job description content.",
+                "job_url": final_url or seed_url,
+                "job_page_text_sample": page_text[:1000],
+            }
+
         return {
             "is_valid_open_job": False,
             "invalid_reason": "Job page is closed, invalid, not found, or has no real job description.",
@@ -1805,6 +1918,11 @@ def open_job_page_and_extract(context, client: genai.Client, company_domain: str
         enriched = {}
 
     if enriched.get("is_valid_open_job") is False:
+        # do not lose valid same-page jobs
+        same_page_result = try_build_same_page_job(job_seed)
+        if same_page_result.get("is_valid_open_job"):
+            return same_page_result
+
         return {
             "is_valid_open_job": False,
             "invalid_reason": "Gemini classified job page as invalid/closed.",
@@ -1917,6 +2035,7 @@ def process_single_rendered_page(
     page_text = ""
     job_cards: List[Dict[str, str]] = []
     next_pages: List[str] = []
+    job_seeds: List[Dict[str, Any]] = []
 
     try:
         ok = safe_goto(page, page_url)
@@ -1951,6 +2070,11 @@ def process_single_rendered_page(
         ]
 
         job_seeds = patch_missing_seed_urls(job_seeds, job_cards, company_domain)
+
+        # attach same-page fallback context to each seed
+        for seed in job_seeds:
+            seed["__page_url"] = page_url
+            seed["__page_text"] = page_text
 
         raw["job_seeds"] = job_seeds
 
@@ -2061,6 +2185,26 @@ def process_single_rendered_page(
 
         if is_blocked_external_board(job_url):
             reason = "Removed because URL belongs to blocked external job board."
+
+            raw["skipped_jobs"].append({
+                "seed": seed,
+                "reason": reason,
+                "job_url": job_url,
+            })
+
+            add_skipped_job(
+                skipped_jobs=skipped_jobs_debug,
+                company_domain=company_domain,
+                career_page_url=root_career_page_url,
+                seed=seed,
+                reason=reason,
+                checked_at=checked_at,
+                final_job_url=job_url,
+            )
+            continue
+
+        if has_bad_url_fragment(job_url):
+            reason = "Removed because resolved URL was a non-job policy/legal/about page."
 
             raw["skipped_jobs"].append({
                 "seed": seed,
